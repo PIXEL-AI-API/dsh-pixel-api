@@ -88,6 +88,7 @@ const {
   ToolCallId,
 } = await hostImport('@deepseek-ai/dsh-llm', 'lib/index.js')
 const { idleWatchdog, timeoutOf } = await hostImport('@deepseek-ai/dsh-timeout', 'lib/index.js')
+const { requestImageDimensions } = await hostImport('@deepseek-ai/dsh-attachment', 'lib/index.js')
 const { default: z } = await hostImport('@deepseek-ai/schemastery', 'lib/index.mjs')
 
 export const name = 'pixel-api'
@@ -213,9 +214,23 @@ function flattenText(blocks) {
     .join('')
 }
 
-// Request-image budgets handed to the attachment store, mirroring the pi-ai
-// adapter's defaults: one bounded normalized version per retained image.
-const IMAGE_TARGET = { maxPixels: 1_048_576, maxBytes: 1_500_000 }
+// Request-image budget: the attachment store takes a target size and a byte
+// bound, not a pixel budget. Width/height come from the source aspect ratio
+// scaled to fit IMAGE_MAX_PIXELS, which is what the shipped pi-ai adapter does.
+const IMAGE_MAX_PIXELS = 1_048_576
+const IMAGE_MAX_BYTES = 1_500_000
+const IMAGE_FALLBACK_EDGE = 1024
+
+function imageTarget(ref) {
+  const width = Number(ref?.width)
+  const height = Number(ref?.height)
+  // A source without usable intrinsic dimensions (older attachment) still needs
+  // a positive size: fall back to a square target and let the store scale.
+  if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
+    return { width: IMAGE_FALLBACK_EDGE, height: IMAGE_FALLBACK_EDGE, maxBytes: IMAGE_MAX_BYTES }
+  }
+  return { ...requestImageDimensions(width, height, IMAGE_MAX_PIXELS), maxBytes: IMAGE_MAX_BYTES }
+}
 
 // OpenAI chat-completions content parts for one block list. Text-only content
 // stays a plain string (smaller payload, accepted by every upstream model);
@@ -328,8 +343,27 @@ async function serializeRequest(options, group, images) {
     ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
     ...(options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens }),
     ...(options.stop !== undefined ? { stop: options.stop } : {}),
+    // Sent only when the user picked a level: the site converts this field to
+    // each upstream format (Claude output_config, Gemini thinkingConfig) and a
+    // model without thinking support answers its own error, surfaced verbatim.
+    ...(options.reasoningEffort === undefined ? {} : { reasoning_effort: options.reasoningEffort }),
   }
 }
+
+// Reasoning ladder the site accepts (relaykit ParseEffort): none … max. Every
+// route declares the same set because the model behind a group is chosen
+// server-side; the site maps or ignores a level per upstream model.
+const REASONING_EFFORTS = [
+  { id: 'minimal', name: 'Minimal' },
+  { id: 'low', name: 'Low' },
+  { id: 'medium', name: 'Medium' },
+  { id: 'high', name: 'High' },
+  { id: 'xhigh', name: 'Xhigh' },
+  { id: 'max', name: 'Max' },
+]
+// No defaultEffort: an unpicked level sends no field, so the upstream uses its
+// own default instead of being forced to one rung of the ladder. Every list and
+// resolve site spreads this same ladder, so the picker agrees with the call.
 
 // ---------------------------------------------------------------------------
 // SSE — minimal self-contained parser over the response body. Yields each
@@ -555,6 +589,8 @@ class PixelAdapter extends LlmAdapter {
         provider,
         id,
         name: id,
+        inputModalities: ['text', 'image'],
+        reasoning: { efforts: REASONING_EFFORTS.map((effort) => ({ ...effort })) },
         ...(catalog.meta.has(id) ? { description: catalog.meta.get(id) } : {}),
       }))
     }
@@ -566,7 +602,13 @@ class PixelAdapter extends LlmAdapter {
     // offers; vision-capable ones accept image parts in the same OpenAI
     // content array. Declaring image input keeps the composer's attach button
     // usable — a text-only upstream answers its own error, surfaced verbatim.
-    return { provider, id: model, name: model, inputModalities: ['text', 'image'] }
+    return {
+      provider,
+      id: model,
+      name: model,
+      inputModalities: ['text', 'image'],
+      reasoning: { efforts: REASONING_EFFORTS.map((effort) => ({ ...effort })) },
+    }
   }
 
   async *stream(options) {
@@ -1314,7 +1356,13 @@ export function apply(ctx, config) {
       }
       ids = await pending
     }
-    return ids.map((id) => ({ provider, id, name: id }))
+    return ids.map((id) => ({
+      provider,
+      id,
+      name: id,
+      inputModalities: ['text', 'image'],
+      reasoning: { efforts: REASONING_EFFORTS.map((effort) => ({ ...effort })) },
+    }))
   }
 
   // Pricing catalog unavailable: retry the single /api/pricing call at most
@@ -1337,6 +1385,8 @@ export function apply(ctx, config) {
         provider,
         id,
         name: id,
+        inputModalities: ['text', 'image'],
+        reasoning: { efforts: REASONING_EFFORTS.map((effort) => ({ ...effort })) },
         ...(catalog.meta.has(id) ? { description: catalog.meta.get(id) } : {}),
       }))
     }
@@ -1361,8 +1411,12 @@ export function apply(ctx, config) {
         const key = ref.attachmentId
         let pending = cache.get(key)
         if (pending === undefined) {
-          pending = store.readImageRequest(ref, IMAGE_TARGET).catch((error) => {
+          const target = imageTarget(ref)
+          trace('image target', { size: `${target.width}x${target.height}`, maxBytes: target.maxBytes,
+            source: `${ref?.width ?? '?'}x${ref?.height ?? '?'}`, mediaType: ref?.mediaType })
+          pending = store.readImageRequest(ref, target).catch((error) => {
             cache.delete(key)
+            trace('image FAILED', String(error?.message ?? error).slice(0, 200))
             throw new LlmError(
               `pixel-api: cannot prepare image ${String(key).slice(0, 16)}: ${error?.message ?? error}`,
               'UNSUPPORTED_CONTENT',
