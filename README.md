@@ -55,7 +55,9 @@ https://github.com/PIXEL-AI-API/dsh-pixel-api#v0.1.0
 ## 限制
 
 - 分组倍率与模型列表在登录时拉取；主站改了倍率后，点一次「刷新」或重新登录即可同步。
-- 依赖 Harness `0.2.2-rc.3` 以上、`0.3.0` 以下版本（见 `package.json` 的 `engines.dsh`）。
+- **版本兼容**：支持 Harness `0.2.2-rc.1` 及以上、`0.3.0` 以下（见 `package.json` 的 `engines.dsh`）。
+  - 图片输入依赖 Harness 的 `@deepseek-ai/dsh-attachment` 包。若该运行时没有这个包，插件照常加载、文本对话正常，只是在发送带图片的消息时会明确提示图片不可用，而不是整个插件加载失败。
+  - 图片缩放优先调用运行时的 `requestImageDimensions`；运行时未提供时使用插件内置的等价实现（已逐项对照官方算法验证一致）。
 
 ## 停用
 

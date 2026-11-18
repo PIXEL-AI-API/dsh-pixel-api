@@ -88,8 +88,38 @@ const {
   ToolCallId,
 } = await hostImport('@deepseek-ai/dsh-llm', 'lib/index.js')
 const { idleWatchdog, timeoutOf } = await hostImport('@deepseek-ai/dsh-timeout', 'lib/index.js')
-const { requestImageDimensions } = await hostImport('@deepseek-ai/dsh-attachment', 'lib/index.js')
 const { default: z } = await hostImport('@deepseek-ai/schemastery', 'lib/index.mjs')
+
+// `@deepseek-ai/dsh-attachment` is optional: a runtime that predates it still
+// loads this plugin (image input then reports a clear error at send time
+// instead of failing the whole module at import).
+const attachment = await hostImport('@deepseek-ai/dsh-attachment', 'lib/index.js')
+  .catch(() => undefined)
+const requestImageDimensions = attachment?.requestImageDimensions
+
+// Local mirror of the runtime's aspect-preserving scale, used when an older
+// runtime does not export it. Kept byte-for-byte equivalent to
+// dsh-attachment's requestImageDimensions so both paths agree exactly.
+function fallbackImageDimensions(width, height, maxPixels) {
+  const scale = Math.min(1, Math.sqrt(maxPixels / (width * height)))
+  if (scale === 1) return { width, height }
+  if (width >= height) {
+    let projectedWidth = Math.max(1, Math.floor(width * scale))
+    let projectedHeight = Math.max(1, Math.round(projectedWidth * height / width))
+    while (projectedWidth * projectedHeight > maxPixels && projectedWidth > 1) {
+      projectedWidth -= 1
+      projectedHeight = Math.max(1, Math.round(projectedWidth * height / width))
+    }
+    return { width: projectedWidth, height: projectedHeight }
+  }
+  let projectedHeight = Math.max(1, Math.floor(height * scale))
+  let projectedWidth = Math.max(1, Math.round(projectedHeight * width / height))
+  while (projectedWidth * projectedHeight > maxPixels && projectedHeight > 1) {
+    projectedHeight -= 1
+    projectedWidth = Math.max(1, Math.round(projectedHeight * width / height))
+  }
+  return { width: projectedWidth, height: projectedHeight }
+}
 
 export const name = 'pixel-api'
 export const inject = ['llm']
@@ -229,7 +259,8 @@ function imageTarget(ref) {
   if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
     return { width: IMAGE_FALLBACK_EDGE, height: IMAGE_FALLBACK_EDGE, maxBytes: IMAGE_MAX_BYTES }
   }
-  return { ...requestImageDimensions(width, height, IMAGE_MAX_PIXELS), maxBytes: IMAGE_MAX_BYTES }
+  const scale = requestImageDimensions ?? fallbackImageDimensions
+  return { ...scale(width, height, IMAGE_MAX_PIXELS), maxBytes: IMAGE_MAX_BYTES }
 }
 
 // OpenAI chat-completions content parts for one block list. Text-only content
