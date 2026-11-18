@@ -4,13 +4,19 @@ DeepSeek Harness 插件：用 [PIXEL](https://api.ai-pixel.online) 主站账号�
 
 ## 安装
 
-在 DeepSeek Harness 的 **插件 → 添加插件** 里填包名：
+在 DeepSeek Harness 的 **插件 → 添加插件** 里填 GitHub 仓库地址：
 
 ```
-dsh-pixel-api
+https://github.com/PIXEL-AI-API/dsh-pixel-api
 ```
 
-也可以填 GitHub 仓库地址或本地目录路径。
+需要固定某个版本时在末尾加提交号或标签，例如：
+
+```
+https://github.com/PIXEL-AI-API/dsh-pixel-api#v0.1.0
+```
+
+也可以填本地目录路径，或把仓库克隆到本地后填该目录。
 
 ## 使用
 
