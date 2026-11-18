@@ -1,6 +1,6 @@
 {
   "name": "dsh-pixel-api",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Sign in with a PIXEL main-site account and mount its playground groups as DeepSeek Harness model providers, billed to the site wallet with no API key.",
   "keywords": [
     "dsh-plugin",
@@ -34,7 +34,9 @@
     "LICENSE"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,

@@ -213,15 +213,37 @@ function flattenText(blocks) {
     .join('')
 }
 
-// Core image blocks are rejected before any text-flattening path can silently
-// erase them; this adapter is text-only.
-function assertTextOnly(blocks) {
-  if (contentHasImage(blocks)) {
-    throw new LlmError(
-      'pixel-api: the site playground chat-completions route does not support image content.',
-      'UNSUPPORTED_CONTENT',
-    )
+// Request-image budgets handed to the attachment store, mirroring the pi-ai
+// adapter's defaults: one bounded normalized version per retained image.
+const IMAGE_TARGET = { maxPixels: 1_048_576, maxBytes: 1_500_000 }
+
+// OpenAI chat-completions content parts for one block list. Text-only content
+// stays a plain string (smaller payload, accepted by every upstream model);
+// image blocks become `image_url` data URLs, which the site's relay forwards
+// verbatim to the upstream model.
+async function serializeContent(blocks, images) {
+  if (!contentHasImage(blocks)) return flattenText(blocks)
+  const parts = []
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      if (block.text.length > 0) parts.push({ type: 'text', text: block.text })
+      continue
+    }
+    if (block.type !== 'image') continue
+    if (block.offloaded === true) {
+      parts.push({ type: 'text', text: '[image omitted to fit the request limits]' })
+      continue
+    }
+    const version = await images.read(block.attachment)
+    parts.push({
+      type: 'image_url',
+      image_url: { url: `data:${version.mediaType};base64,${Buffer.from(version.data).toString('base64')}` },
+    })
   }
+  // An image-only turn must still carry a text part: some upstream models
+  // reject a content array without one.
+  if (!parts.some((part) => part.type === 'text')) parts.unshift({ type: 'text', text: '' })
+  return parts
 }
 
 function serializeAssistant(message) {
@@ -251,11 +273,13 @@ function serializeAssistant(message) {
   }
 }
 
-function serializeMessages(messages) {
+async function serializeMessages(messages, images) {
   const wire = []
   for (const message of messages) {
-    assertTextOnly(message.content)
     if (message.role === 'system') {
+      if (contentHasImage(message.content)) {
+        throw new LlmError('pixel-api: a system message cannot carry an image', 'UNSUPPORTED_CONTENT')
+      }
       wire.push({ role: 'system', content: flattenText(message.content) })
       continue
     }
@@ -266,9 +290,10 @@ function serializeMessages(messages) {
     // user role: tool results ride in user messages in the harness vocabulary,
     // but the wire wants them as standalone role:'tool' messages.
     const toolResults = message.content.filter((block) => block.type === 'tool-result')
-    const text = flattenText(message.content)
-    if (text.length > 0 || toolResults.length === 0) {
-      wire.push({ role: 'user', content: text })
+    const content = await serializeContent(message.content, images)
+    const hasContent = typeof content === 'string' ? content.length > 0 : true
+    if (hasContent || toolResults.length === 0) {
+      wire.push({ role: 'user', content })
     }
     for (const result of toolResults) {
       wire.push({
@@ -281,12 +306,12 @@ function serializeMessages(messages) {
   return wire
 }
 
-function serializeRequest(options, group) {
+async function serializeRequest(options, group, images) {
   const messages = []
   if (options.system !== undefined) {
     messages.push({ role: 'system', content: options.system })
   }
-  messages.push(...serializeMessages(options.messages))
+  messages.push(...await serializeMessages(options.messages, images))
 
   const tools = options.tools?.map((tool) => ({
     type: 'function',
@@ -537,7 +562,11 @@ class PixelAdapter extends LlmAdapter {
   }
 
   async resolveModel(provider, model) {
-    return { provider, id: model, name: model }
+    // The site routes each request to whatever upstream model the group
+    // offers; vision-capable ones accept image parts in the same OpenAI
+    // content array. Declaring image input keeps the composer's attach button
+    // usable — a text-only upstream answers its own error, surfaced verbatim.
+    return { provider, id: model, name: model, inputModalities: ['text', 'image'] }
   }
 
   async *stream(options) {
@@ -583,7 +612,7 @@ class PixelAdapter extends LlmAdapter {
   }
 
   async *request(options, group, signal, onComment) {
-    const payload = JSON.stringify(serializeRequest(options, group))
+    const payload = JSON.stringify(await serializeRequest(options, group, this.deps.images()))
     let response
     // A stale access token answers 401 once: invalidate it, re-resolve the
     // session (refresh or re-login), and retry the identical payload.
@@ -1315,11 +1344,44 @@ export function apply(ctx, config) {
     return groupModels(group, provider)
   }
 
+  // Request images come from the durable attachment service the same way the
+  // shipped pi-ai adapter reads them: one bounded normalized version per
+  // retained image, base64 inlined into the data URL.
+  const images = () => {
+    const store = ctx.get('attachments')
+    if (store === undefined || typeof store.readImageRequest !== 'function') {
+      throw new LlmError(
+        'pixel-api: image input needs the attachment service, which this profile does not mount',
+        'UNSUPPORTED_CONTENT',
+      )
+    }
+    const cache = new Map()
+    return {
+      async read(ref) {
+        const key = ref.attachmentId
+        let pending = cache.get(key)
+        if (pending === undefined) {
+          pending = store.readImageRequest(ref, IMAGE_TARGET).catch((error) => {
+            cache.delete(key)
+            throw new LlmError(
+              `pixel-api: cannot prepare image ${String(key).slice(0, 16)}: ${error?.message ?? error}`,
+              'UNSUPPORTED_CONTENT',
+              { cause: error },
+            )
+          })
+          cache.set(key, pending)
+        }
+        return pending
+      },
+    }
+  }
+
   const adapter = new PixelAdapter({
     routes: () => state.routes,
     catalog: () => state.catalog,
     groupModels,
     fallbackModels,
+    images,
     ensureAccess,
     invalidateAccess: () => {
       state.accessToken = ''
