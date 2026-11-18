@@ -1,3 +1,25 @@
+# dsh-pixel-api — PIXEL (Pixel API) main-site account for DeepSeek Harness.
+# https://github.com/kouzhenqi/dsh-pixel-api
+#
+# One Host plugin row. It logs in to the PIXEL main site with the user's own
+# account, then mirrors the account's playground groups as `pixel/<group>`
+# provider routes. Chat goes through the site's session-only
+# /pg/chat/completions endpoint, so the site bills the login user's wallet and
+# no API key is ever created or stored.
+#
+# Credentials the plugin manages (never written to this file):
+#   PIXEL_API_PASSWORD — used for exactly one sign-in, then deleted
+#   PIXEL_API_REFRESH  — the site's `new_api_refresh` session cookie
+#   PIXEL_API_2FA      — one-shot TOTP code consumed during a login challenge
+#
+# Knobs under `config`:
+# - debug: true   write ~/.dsh/pixel-api/debug.log (no secrets, 512 KiB cap)
+# - username      the account name; normally written by the settings page
+# - refreshAt     bump to ask the plugin to refetch balance/groups
+# - signOutAt     bump to revoke the site session and clear local credentials
+#
+# Keep the row id `pixel-api`: it is also the plugin's settings namespace, so
+# changing it would orphan an existing login.
 - insert:
     - id: pixel-api
       name: 'dsh-pixel-api'
