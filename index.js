@@ -142,8 +142,20 @@ const Profile = z.object({
   updatedAt: z.number().default(0),
 }).default({ ...EMPTY_PROFILE })
 
+// Context capacity declared for every PIXEL model unless an override names it.
+// The site publishes no per-model limit, so this is an assumption the user can
+// tune on the settings page. Harness compaction needs a declared capacity: a
+// route without one cannot be switched to mid-session
+// (MODEL_SWITCH_COMPACTION_FAILED) and never compacts automatically.
+const DEFAULT_CONTEXT_WINDOW = 272_000
+
 export const Config = z.object({
   username: z.string().default('').volatile(),
+  // Context window (tokens) declared to the Harness for PIXEL models.
+  contextWindow: z.natural().default(DEFAULT_CONTEXT_WINDOW).volatile(),
+  // Per-model context windows keyed by an exact model id or a `prefix*`
+  // pattern (case-insensitive; exact beats prefix, longer prefix wins).
+  contextWindows: z.dict(z.natural()).default({}).volatile(),
   // Settings page "刷新" bumps this; the host refetches profile + groups.
   refreshAt: z.number().default(0).volatile(),
   // Settings page "退出登录" bumps this; the host revokes the site session.
@@ -184,6 +196,34 @@ function formatRatio(ratio) {
   const n = typeof ratio === 'string' ? Number(ratio) : ratio
   if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) return ''
   return String(Number(n.toFixed(4)))
+}
+
+const isContextWindow = (value) => Number.isSafeInteger(value) && value > 0
+
+// Capacity declared for one model id: an exact override, else the longest
+// matching `prefix*` override, else the configured default. Unusable entries
+// are skipped rather than reported — resolveModel runs before every request,
+// and an invalid capacity would fail each one with INVALID_MODEL_CONTEXT.
+function contextWindowFor(model, defaultWindow, overrides) {
+  const id = String(model).toLowerCase()
+  let prefixWindow
+  let prefixLength = 0
+  for (const [pattern, value] of Object.entries(overrides ?? {})) {
+    if (!isContextWindow(value)) continue
+    const key = pattern.trim().toLowerCase()
+    if (!key.endsWith('*')) {
+      if (key === id) return value
+      continue
+    }
+    // A bare `*` is not a pattern: the default already covers every model.
+    const prefix = key.slice(0, -1)
+    if (prefix.length > prefixLength && id.startsWith(prefix)) {
+      prefixWindow = value
+      prefixLength = prefix.length
+    }
+  }
+  if (prefixWindow !== undefined) return prefixWindow
+  return isContextWindow(defaultWindow) ? defaultWindow : DEFAULT_CONTEXT_WINDOW
 }
 
 const REFS = {
@@ -453,6 +493,15 @@ async function* parseSse(stream, onComment) {
 // Chunk translation — wire deltas to DSH StreamChunks, keeping block ordering.
 // ---------------------------------------------------------------------------
 
+// Provider refusal code. Harness 0.2.2-rc.4 registered CONTENT_REFUSED for
+// content-safety stops (its DeepSeek adapter's `refusal`); earlier runtimes
+// carry the same string as an ordinary provider code.
+const CONTENT_REFUSED_CODE = 'CONTENT_REFUSED'
+// OpenAI error codes the site's content-policy category returns.
+const REFUSAL_ERROR_CODES = new Set(['content_policy_violation', 'content_filter', 'invalid_prompt', 'cyber_policy'])
+// Sentinel finish: the stream is ended as a CONTENT_REFUSED failure at [DONE].
+const REFUSED = Symbol('pixel-api refused')
+
 function mapFinishReason(reason) {
   switch (reason) {
     case 'stop':
@@ -460,9 +509,9 @@ function mapFinishReason(reason) {
     case 'length':
       return { kind: 'max-tokens' }
     case 'tool_calls':
-      return { kind: 'tool-call' }
+      return { kind: 'tool-calls' }
     case 'content_filter':
-      return { kind: 'content-filter' }
+      return REFUSED
     default:
       return { kind: 'error', failure: { message: `unknown finish_reason "${reason}"`, code: 'UNKNOWN_FINISH_REASON' } }
   }
@@ -507,6 +556,15 @@ async function* translate(payloads) {
         yield { type: 'block-end', index: block.index, block: closeBlock(block) }
       }
       if (pendingUsage) yield { type: 'usage', usage: pendingUsage }
+      // A content-filter stop is a refusal, not a completed answer: report the
+      // billed usage above, then fail the attempt the way the Harness's own
+      // DeepSeek adapter fails a `refusal` stop.
+      if (pendingFinish === REFUSED) {
+        throw new LlmError(
+          'pixel-api: the upstream model refused to answer under its content policy (finish_reason content_filter)',
+          CONTENT_REFUSED_CODE,
+        )
+      }
       const reason = pendingFinish ?? { kind: 'stop' }
       yield {
         type: 'finish',
@@ -581,9 +639,18 @@ async function* translate(payloads) {
 // ---------------------------------------------------------------------------
 
 function providerErrorCode(status, error) {
-  const detail = error?.message ?? ''
+  // Classify on code, type and message together, as the runtime's classifiers
+  // expect. The site tags a context overflow with code context_length_exceeded
+  // but may pass the upstream's own wording through as the message (Claude
+  // "prompt is too long: …", Gemini "The input token count …"), which a
+  // message-only check misses — and overflow recovery keys on this code.
+  const code = typeof error?.code === 'string' ? error.code : ''
+  const detail = [code, error?.type, error?.message]
+    .filter((part) => typeof part === 'string' && part.length > 0)
+    .join(' ')
   if (isQuotaExceededError(detail)) return QUOTA_EXCEEDED_CODE
   if (isContextWindowExceededError(detail)) return CONTEXT_WINDOW_EXCEEDED_CODE
+  if (REFUSAL_ERROR_CODES.has(code.toLowerCase())) return CONTENT_REFUSED_CODE
   if (status === 401 || status === 403) return 'AUTH'
   if (status === 429) return 'RATE_LIMIT'
   if (status >= 500) return 'PROVIDER_ERROR'
@@ -639,6 +706,10 @@ class PixelAdapter extends LlmAdapter {
       name: model,
       inputModalities: ['text', 'image'],
       reasoning: { efforts: REASONING_EFFORTS.map((effort) => ({ ...effort })) },
+      // compaction-basic prices switches and step pressure against this
+      // capacity. No defaultMaxTokens: the runtime would materialize it as
+      // max_tokens on every request, and the site leaves the cap upstream.
+      context: { contextWindow: this.deps.contextWindow(model) },
     }
   }
 
@@ -794,6 +865,12 @@ export function apply(ctx, config) {
       signOutAt: Number(cell(cfg.signOutAt) ?? 0) || 0,
       auth: cell(cfg.auth) ?? {},
     }
+  }
+  // Read per call: the settings page commits these volatile cells in place,
+  // so a changed window applies to the next request without a fiber restart.
+  const contextWindowOf = (model) => {
+    const cfg = config ?? ctx.config ?? {}
+    return contextWindowFor(model, Number(cell(cfg.contextWindow)), cell(cfg.contextWindows))
   }
 
   // Canonical auth shape: fixed key order so the dedupe compare below is a
@@ -1464,6 +1541,7 @@ export function apply(ctx, config) {
   const adapter = new PixelAdapter({
     routes: () => state.routes,
     catalog: () => state.catalog,
+    contextWindow: contextWindowOf,
     groupModels,
     fallbackModels,
     images,

@@ -1,7 +1,8 @@
 // PIXEL API — browser half. Registers the 设置 → PIXEL API page: account
 // login (username + password → settings/credentials wire), one-shot TOTP for
-// 2FA challenges, a session status card, and logout. No secret is ever held
-// or rendered here — the host half owns tokens, refresh, and chat traffic.
+// 2FA challenges, a session status card, the context window settings, and
+// logout. No secret is ever held or rendered here — the host half owns
+// tokens, refresh, and chat traffic.
 
 window.__ModuleLoader__.load({
   id: 'dsh-pixel-api',
@@ -77,6 +78,20 @@ window.__ModuleLoader__.load({
       'err.requiredOtp': '请输入两步验证码。',
       'site': '服务地址',
       'walletMode': '钱包直接扣费（无 API Key）',
+      'ctx.title': '上下文窗口',
+      'ctx.desc': 'Harness 按这个窗口决定何时自动压缩历史，以及会话中途能否切换到 PIXEL 模型。主站不提供各模型的实际上限，默认按 272K token 计算；与实际不符时在这里调整。',
+      'ctx.default': '默认窗口（token）',
+      'ctx.overrides': '按模型单独设置',
+      'ctx.overrides.placeholder': '每行一条：模型 ID = token 数，以 * 结尾按前缀匹配\ngemini-* = 1048576\nclaude-opus-5-5 = 1000000',
+      'ctx.hint': '精确的模型 ID 优先于前缀，较长的前缀优先于较短的，不区分大小写；数字可写 272k、1m。修改从下一次请求起生效。',
+      'ctx.summary': '当前默认 {window} token · {rules} 条单独设置',
+      'ctx.save': '保存',
+      'ctx.saving': '保存中…',
+      'ctx.reset': '恢复默认',
+      'ctx.saved': '已保存，下一次请求起生效。',
+      'err.ctx.default': '默认窗口必须是大于 65536 的整数（Harness 压缩默认预留 65536 token）。',
+      'err.ctx.line': '第 {line} 行格式不对：应为「模型 ID = token 数」，token 数须为大于 65536 的整数。',
+      'err.ctx.star': '第 {line} 行：单独的 * 会覆盖所有模型，请直接修改默认窗口。',
     }
 
     const en = {
@@ -123,6 +138,20 @@ window.__ModuleLoader__.load({
       'err.requiredOtp': 'Enter the two-factor code.',
       'site': 'Server',
       'walletMode': 'Direct Wallet Billing (No API Key)',
+      'ctx.title': 'Context window',
+      'ctx.desc': 'The Harness uses this window to decide when to compact history and whether a session can switch to a PIXEL model mid-conversation. The site does not publish per-model limits, so 272K tokens is assumed; adjust it here when a model differs.',
+      'ctx.default': 'Default window (tokens)',
+      'ctx.overrides': 'Per-model windows',
+      'ctx.overrides.placeholder': 'One per line: model ID = tokens; end with * to match a prefix\ngemini-* = 1048576\nclaude-opus-5-5 = 1000000',
+      'ctx.hint': 'An exact model ID beats a prefix and a longer prefix beats a shorter one, ignoring case; numbers may be written as 272k or 1m. Changes apply from the next request.',
+      'ctx.summary': 'Default {window} tokens · {rules} per-model rules',
+      'ctx.save': 'Save',
+      'ctx.saving': 'Saving…',
+      'ctx.reset': 'Restore defaults',
+      'ctx.saved': 'Saved; applies from the next request.',
+      'err.ctx.default': 'The default window must be an integer above 65536 (Harness compaction reserves 65536 tokens by default).',
+      'err.ctx.line': 'Line {line} is malformed: use "model ID = tokens" with an integer above 65536.',
+      'err.ctx.star': 'Line {line}: a bare * would cover every model; change the default window instead.',
     }
 
     // Inline SVG Icons
@@ -676,6 +705,45 @@ window.__ModuleLoader__.load({
           border-radius: var(--dsw-radius-md, 8px);
           font-size: 13px;
         }
+
+        .pxa-input.narrow { max-width: 220px; font-variant-numeric: tabular-nums; }
+
+        .pxa-textarea {
+          box-sizing: border-box;
+          width: 100%;
+          min-height: 92px;
+          padding: 8px 12px;
+          border-radius: var(--dsw-radius-md, 8px);
+          border: 1px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.25));
+          background: var(--dsw-alias-bg-layer-1, #ffffff);
+          color: var(--dsw-alias-label-primary, #18191b);
+          font-size: 13px;
+          line-height: 20px;
+          font-family: var(--dsw-font-mono, monospace);
+          outline: none;
+          resize: vertical;
+          transition: border-color .15s ease, box-shadow .15s ease;
+        }
+
+        .pxa-textarea:focus {
+          border-color: var(--dsw-alias-state-business-primary, #4d6bfe);
+          box-shadow: 0 0 0 2px color-mix(in srgb, var(--dsw-alias-state-business-primary, #4d6bfe) 18%, transparent);
+        }
+
+        .pxa-textarea::placeholder { color: var(--dsw-alias-label-dimmed, #9ca3af); opacity: 1; }
+        .pxa-textarea:disabled { opacity: 0.6; cursor: not-allowed; }
+
+        .pxa-hint {
+          font-size: 12px;
+          line-height: 18px;
+          color: var(--dsw-alias-label-tertiary, #81858c);
+          margin: 0;
+        }
+
+        .pxa-saved {
+          font-size: 12px;
+          color: var(--dsw-alias-state-success-primary, #2ea043);
+        }
       `
       document.head.appendChild(style)
       return () => style.remove()
@@ -683,6 +751,166 @@ window.__ModuleLoader__.load({
 
     const msg = (e) => (e && e.message) ? e.message : String(e)
     const authOf = (section) => (section && section.auth) ? section.auth : { state: 'none', message: '', user: '', groups: [], models: -1 }
+    const fillText = (t, key, vars) => Object.entries(vars).reduce(
+      (text, [k, v]) => text.split('{' + k + '}').join(String(v)), t(key))
+
+    // Context window settings. The host declares `contextWindow`, or the best
+    // matching `contextWindows` rule, as each PIXEL model's capacity; Harness
+    // compaction and its model-switch check price history against it. A value
+    // at or below the 65536-token compaction headroom would still refuse every
+    // switch, so the page rejects it (the patch file can go lower).
+    const DEFAULT_CONTEXT_WINDOW = 272000
+    const MIN_CONTEXT_WINDOW = 65537
+
+    // "272000", "272,000", "272_000", "272k", "1m", "1.5m" → integer tokens.
+    function parseTokens(text) {
+      const s = String(text).trim().toLowerCase().replace(/[,_\s]/g, '')
+      const m = /^(\d+(?:\.\d+)?)([km]?)$/.exec(s)
+      if (!m) return undefined
+      const n = Number(m[1]) * (m[2] === 'k' ? 1000 : m[2] === 'm' ? 1000000 : 1)
+      return Number.isSafeInteger(n) ? n : undefined
+    }
+
+    const formatRules = (rules) => Object.entries(rules || {}).map(([k, v]) => k + ' = ' + v).join('\n')
+
+    // One rule per line, `<model id or prefix*> = <tokens>`; blank lines and
+    // `#` comments are skipped, and a repeated id (ignoring case) keeps the
+    // last line. Returns { rules } or { error }.
+    function parseRules(text, t) {
+      const rules = {}
+      const lines = String(text).split(/\r?\n/)
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim()
+        if (!line || line.startsWith('#')) continue
+        const at = line.lastIndexOf('=')
+        const key = at > 0 ? line.slice(0, at).trim() : ''
+        const tokens = at > 0 ? parseTokens(line.slice(at + 1)) : undefined
+        if (!key || tokens === undefined || tokens < MIN_CONTEXT_WINDOW) {
+          return { error: fillText(t, 'err.ctx.line', { line: i + 1 }) }
+        }
+        if (key === '*') return { error: fillText(t, 'err.ctx.star', { line: i + 1 }) }
+        for (const existing of Object.keys(rules)) {
+          if (existing.toLowerCase() === key.toLowerCase()) delete rules[existing]
+        }
+        rules[key] = tokens
+      }
+      return { rules }
+    }
+
+    const LayersIcon = () => h('svg', { width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' },
+      h('polygon', { points: '12 2 2 7 12 12 22 7 12 2' }),
+      h('polyline', { points: '2 17 12 22 22 17' }),
+      h('polyline', { points: '2 12 12 17 22 12' })
+    )
+
+    function ContextCard(props) {
+      const { api, t, section, reload } = props
+      const stored = Number(section && section.contextWindow)
+      const currentWindow = Number.isSafeInteger(stored) && stored > 0 ? stored : DEFAULT_CONTEXT_WINDOW
+      const storedRules = section && section.contextWindows
+      const currentRules = storedRules && typeof storedRules === 'object' ? storedRules : {}
+      const sourceKey = currentWindow + '\n' + formatRules(currentRules)
+      const fresh = () => ({ window: String(currentWindow), rules: formatRules(currentRules), dirty: false, source: sourceKey })
+      const [form, setForm] = useState(fresh)
+      const [saving, setSaving] = useState(false)
+      const [error, setError] = useState(null)
+      const [saved, setSaved] = useState(false)
+
+      // Follow the stored value until the user edits: a host status write
+      // landing mid-edit must not wipe what they typed.
+      useEffect(() => {
+        setForm((f) => (f.dirty || f.source === sourceKey ? f : fresh()))
+      }, [sourceKey])
+
+      const commit = async (windowValue, rules) => {
+        setSaving(true)
+        setError(null)
+        setSaved(false)
+        try {
+          await api.settings.mutate(NS, [
+            { op: 'set', path: ['contextWindow'], value: windowValue },
+            { op: 'set', path: ['contextWindows'], value: rules },
+          ])
+          const text = formatRules(rules)
+          setForm({ window: String(windowValue), rules: text, dirty: false, source: windowValue + '\n' + text })
+          setSaved(true)
+          // Refetch the section so the summary shows the stored value even if
+          // no settings/document-updated event reaches this page.
+          if (typeof reload === 'function') void reload()
+        } catch (e) {
+          setError(msg(e))
+        } finally {
+          setSaving(false)
+        }
+      }
+      const save = () => {
+        const windowValue = parseTokens(form.window)
+        if (windowValue === undefined || windowValue < MIN_CONTEXT_WINDOW) {
+          setSaved(false)
+          setError(t('err.ctx.default'))
+          return
+        }
+        const parsed = parseRules(form.rules, t)
+        if (parsed.error) {
+          setSaved(false)
+          setError(parsed.error)
+          return
+        }
+        void commit(windowValue, parsed.rules)
+      }
+      const edit = (patch) => {
+        setSaved(false)
+        setForm((f) => ({ ...f, ...patch, dirty: true }))
+      }
+      const ruleCount = Object.keys(currentRules).length
+      const isDefault = currentWindow === DEFAULT_CONTEXT_WINDOW && ruleCount === 0
+
+      return h('div', { className: 'pxa-card' },
+        h('div', { className: 'pxa-card-head' },
+          h('div', { className: 'pxa-card-title' }, h(LayersIcon, null), t('ctx.title')),
+          h('span', { className: 'pxa-hint' },
+            fillText(t, 'ctx.summary', { window: currentWindow.toLocaleString(), rules: ruleCount })),
+        ),
+        h('p', { className: 'pxa-desc' }, t('ctx.desc')),
+        error ? h('div', { className: 'pxa-banner err' }, error) : null,
+        h('div', { className: 'pxa-form' },
+          h('div', { className: 'pxa-field' },
+            h('label', { className: 'pxa-label' }, t('ctx.default')),
+            h('input', {
+              className: 'pxa-input narrow',
+              value: form.window,
+              inputMode: 'numeric',
+              placeholder: String(DEFAULT_CONTEXT_WINDOW),
+              disabled: saving,
+              onChange: (e) => edit({ window: e.target.value }),
+              onKeyDown: (e) => { if (e.key === 'Enter' && !saving && form.dirty) save() },
+            }),
+          ),
+          h('div', { className: 'pxa-field' },
+            h('label', { className: 'pxa-label' }, t('ctx.overrides')),
+            h('textarea', {
+              className: 'pxa-textarea',
+              value: form.rules,
+              placeholder: t('ctx.overrides.placeholder'),
+              spellCheck: false,
+              disabled: saving,
+              onChange: (e) => edit({ rules: e.target.value }),
+            }),
+            h('p', { className: 'pxa-hint' }, t('ctx.hint')),
+          ),
+          h('div', { className: 'pxa-actions' },
+            h('button', { className: 'pxa-btn primary', disabled: saving || !form.dirty, onClick: save },
+              saving ? t('ctx.saving') : t('ctx.save')),
+            h('button', {
+              className: 'pxa-btn',
+              disabled: saving || (isDefault && !form.dirty),
+              onClick: () => void commit(DEFAULT_CONTEXT_WINDOW, {}),
+            }, t('ctx.reset')),
+            saved ? h('span', { className: 'pxa-saved' }, t('ctx.saved')) : null,
+          ),
+        ),
+      )
+    }
 
     function PixelSection(props) {
       const { api, remote, t } = props
@@ -947,7 +1175,7 @@ window.__ModuleLoader__.load({
         ),
       )
 
-      // 3. Logged in: identity card + balance card, nothing else.
+      // 3. Logged in: identity card, balance card, context window card.
       const fill = (key, vars) => Object.entries(vars).reduce(
         (text, [k, v]) => text.split('{' + k + '}').join(String(v)), t(key))
       const profile = auth.profile || {}
@@ -1011,6 +1239,7 @@ window.__ModuleLoader__.load({
             ),
           ),
         ),
+        h(ContextCard, { api, t, section: view.section, reload: load }),
         h('div', { className: 'pxa-footer' },
           h('span', null, groupCount > 0
             ? (modelCount >= 0

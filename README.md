@@ -51,13 +51,23 @@ https://github.com/PIXEL-AI-API/dsh-pixel-api#v0.1.0
 - **文本与工具调用**：标准的对话、多轮工具调用、思考内容回传。
 - **图片输入**：带图片的消息按 OpenAI `image_url` 数据 URL 发给主站，由主站转发给所选分组的上游模型。能否被理解取决于该分组背后的模型是否支持视觉；只支持文本的模型会由上游自己报错，错误信息原样显示。图片先按 Harness 的附件策略归一化（默认上限 1M 像素、约 1.5 MB），过旧的历史图片可能被替换成占位文字而不是让整次请求失败。
 - **推理等级**：模型菜单底部提供 `Minimal / Low / Medium / High / Xhigh / Max` 六档，选中后以 `reasoning_effort` 字段发给主站，由主站转换成各上游模型的格式（Claude 的 `output_config.effort`、Gemini 的 `thinkingConfig`、OpenAI 直传）。**不选则不发该字段**，由上游使用自己的默认强度。各分组背后的实际模型由主站决定，因此档位对所有分组统一显示；不支持思考的模型由上游自行报错。
+- **上下文窗口**：插件为每个 PIXEL 模型向 Harness 声明上下文窗口，Harness 据此决定何时自动压缩历史，以及会话中途能否切换到该模型。主站不提供各模型的实际上限，**默认按 272,000 token 计算**；在 **设置 → PIXEL API → 上下文窗口** 可以改默认值，也可以按模型单独设置（每行 `模型 ID = token 数`，以 `*` 结尾按前缀匹配，如 `gemini-* = 1048576`；精确 ID 优先，较长前缀优先，不区分大小写），从下一次请求起生效。窗口必须大于 65,536（Harness 压缩默认预留的余量），否则切换到该模型仍会被拒绝。宁可设小：设大了，历史超出上游真实上限时请求会失败。
+- **错误分类**：上游超出上下文时报 `CONTEXT_WINDOW_EXCEEDED`，主站把上游原文透传出来时也能识别，Harness 会尝试压缩后重试一次；上游按内容安全策略拒绝时（`finish_reason: content_filter` 或主站的内容策略错误）报 `CONTENT_REFUSED`，与 Harness 0.2.2-rc.4 起 DeepSeek 拒答的错误码一致。
 
 ## 限制
 
 - 分组倍率与模型列表在登录时拉取；主站改了倍率后，点一次「刷新」或重新登录即可同步。
-- **版本兼容**：支持 Harness `0.2.2-rc.1` 及以上、`0.3.0` 以下（见 `package.json` 的 `engines.dsh`）。
+- **版本兼容**：支持 Harness `0.2.2-rc.1` 及以上、`0.3.0` 以下（见 `package.json` 的 `engines.dsh`）。0.2.3 起在 0.2.2-rc.3 桌面版运行时与 0.2.2-rc.5 的运行时包上通过 `test/` 下的检查。
   - 图片输入依赖 Harness 的 `@deepseek-ai/dsh-attachment` 包。若该运行时没有这个包，插件照常加载、文本对话正常，只是在发送带图片的消息时会明确提示图片不可用，而不是整个插件加载失败。
   - 图片缩放优先调用运行时的 `requestImageDimensions`；运行时未提供时使用插件内置的等价实现（已逐项对照官方算法验证一致）。
+
+## 开发检查
+
+不联网、不用真实账号，主站接口全部在本地模拟：
+
+- `test/check-context.mjs`：用真实的 Harness `LlmRuntime` 加载插件，检查上下文窗口声明、按模型覆盖、设置页即时修改，以及拒答与超长错误的分类。桌面版运行时下用 `ELECTRON_RUN_AS_NODE=1 "<DeepSeek Harness.exe>" test/check-context.mjs` 运行；能直接解析 `@deepseek-ai/*` 包的环境用 `node test/check-context.mjs`。
+- `test/check-client.mjs`：在 vm 里执行 `client.js`，操作设置页的上下文窗口卡片（显示、校验、保存、恢复默认）。`node test/check-client.mjs`。
+- `test/check-load.mjs`、`test/check-fallback.mjs`：配置解析与图片缩放。
 
 ## 停用
 

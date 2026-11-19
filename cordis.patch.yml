@@ -1,5 +1,5 @@
 # dsh-pixel-api — PIXEL (Pixel API) main-site account for DeepSeek Harness.
-# https://github.com/kouzhenqi/dsh-pixel-api
+# https://github.com/PIXEL-AI-API/dsh-pixel-api
 #
 # One Host plugin row. It logs in to the PIXEL main site with the user's own
 # account, then mirrors the account's playground groups as `pixel/<group>`
@@ -15,6 +15,12 @@
 # Knobs under `config`:
 # - debug: true   write ~/.dsh/pixel-api/debug.log (no secrets, 512 KiB cap)
 # - username      the account name; normally written by the settings page
+# - contextWindow   tokens declared as each PIXEL model's context window
+#                   (default 272000); Harness compaction and its model-switch
+#                   check use it, so keep it above 65536
+# - contextWindows  per-model windows, e.g. { 'gemini-*': 1048576 }: an exact
+#                   model id or a `prefix*`, case-insensitive; both are also
+#                   editable on the settings page
 # - refreshAt     bump to ask the plugin to refetch balance/groups
 # - signOutAt     bump to revoke the site session and clear local credentials
 #

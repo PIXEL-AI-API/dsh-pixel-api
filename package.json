@@ -1,6 +1,6 @@
 {
   "name": "dsh-pixel-api",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Sign in with a PIXEL main-site account and mount its playground groups as DeepSeek Harness model providers, billed to the site wallet with no API key.",
   "keywords": [
     "dsh-plugin",
