@@ -257,6 +257,66 @@ check('content policy rejection -> CONTENT_REFUSED', finishOf(chunks)?.failure?.
 chunks = await run(httpError(400, { code: 'invalid_request', type: 'invalid_request_error', message: 'bad parameter (request id: r5)' }))
 check('ordinary 400 stays BAD_REQUEST', finishOf(chunks)?.failure?.code === 'BAD_REQUEST', finishOf(chunks))
 
+// ---------------------------------------------------------------------------
+// Usage: the site's OpenAI-shaped usage per upstream family (new-api-main
+// relaykit: claude_messages/to_oai_chat_resp.go buildOpenAIStyleUsageFromClaudeUsage,
+// gemini_chat/to_oai_chat_resp.go, OpenAI passthrough, DeepSeek-type hit/miss).
+log('Usage mapping (cache buckets the client turns into a hit rate)')
+// Mirror of dsh-token-meter src/turn-usage.ts normalizeUsage (lines 85-113):
+// usage that fails it is dropped from turn usage.
+const keptByTurnUsage = (u) => {
+  const isCount = (v) => Number.isSafeInteger(v) && v >= 0
+  if (!isCount(u.inputTokens) || !isCount(u.outputTokens)) return false
+  if (u.cacheReadTokens !== undefined && !isCount(u.cacheReadTokens)) return false
+  if (u.cacheWriteTokens !== undefined && !isCount(u.cacheWriteTokens)) return false
+  const known = u.inputTokens + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0)
+  if (u.totalTokens === undefined) return u.cacheReadTokens !== undefined && u.cacheWriteTokens !== undefined
+  const exact = u.totalTokens - u.outputTokens
+  if (!isCount(exact) || exact < known) return false
+  return u.cacheReadTokens === undefined || u.cacheWriteTokens === undefined || exact === known
+}
+// dsh-client-ui-chat StatsPills.tsx billedInputTokens / cacheHitPercent.
+const sessionHit = (u) => (100 * u.cacheReadTokens) / (u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens)
+const usageCase = async (label, wire, expected) => {
+  const got = (await run(() => sse([choice({ content: 'ok' }), choice({}, 'stop'), { choices: [], usage: wire }, '[DONE]'])))
+    .find((c) => c.type === 'usage')?.usage
+  const fields = ['inputTokens', 'outputTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens']
+  const same = got !== undefined && fields.every((k) => got[k] === expected[k])
+  check(`${label}`, same && keptByTurnUsage(got), { got, expected })
+  return got
+}
+const viaClaude = await usageCase('Claude via site: reads/writes split out of prompt_tokens', {
+  prompt_tokens: 21210, completion_tokens: 103, total_tokens: 21313,
+  prompt_tokens_details: { cached_tokens: 20000, cached_creation_tokens: 1000, cache_write_tokens: 1000, text_tokens: 0, audio_tokens: 0, image_tokens: 0 },
+  usage_semantic: 'openai', usage_source: 'anthropic',
+}, { inputTokens: 210, outputTokens: 103, totalTokens: 21313, cacheReadTokens: 20000, cacheWriteTokens: 1000 })
+if (viaClaude) log(`        client session hit rate: ${sessionHit(viaClaude).toFixed(1)}% (was 0%)`)
+await usageCase('OpenAI passthrough: cached_tokens', {
+  prompt_tokens: 11118, completion_tokens: 172, total_tokens: 11290, prompt_tokens_details: { cached_tokens: 10880 },
+}, { inputTokens: 238, outputTokens: 172, totalTokens: 11290, cacheReadTokens: 10880, cacheWriteTokens: 0 })
+await usageCase('Gemini via site: cached content tokens', {
+  prompt_tokens: 5000, completion_tokens: 50, total_tokens: 5050, prompt_tokens_details: { cached_tokens: 4096 },
+}, { inputTokens: 904, outputTokens: 50, totalTokens: 5050, cacheReadTokens: 4096, cacheWriteTokens: 0 })
+await usageCase('Gemini total that disagrees is left to the runtime', {
+  prompt_tokens: 5000, completion_tokens: 50, total_tokens: 5123, prompt_tokens_details: { cached_tokens: 4096 },
+}, { inputTokens: 904, outputTokens: 50, totalTokens: undefined, cacheReadTokens: 4096, cacheWriteTokens: 0 })
+await usageCase('DeepSeek-type hit/miss: miss is uncached input, not a write', {
+  prompt_tokens: 3000, completion_tokens: 20, total_tokens: 3020, prompt_cache_hit_tokens: 2560, prompt_cache_miss_tokens: 440,
+}, { inputTokens: 440, outputTokens: 20, totalTokens: 3020, cacheReadTokens: 2560, cacheWriteTokens: 0 })
+await usageCase('anthropic semantic: prompt_tokens already excludes the cache', {
+  prompt_tokens: 210, completion_tokens: 103, total_tokens: 313,
+  prompt_tokens_details: { cached_tokens: 20000, cached_creation_tokens: 1000 }, usage_semantic: 'anthropic',
+}, { inputTokens: 210, outputTokens: 103, totalTokens: undefined, cacheReadTokens: 20000, cacheWriteTokens: 1000 })
+await usageCase('no cache reported', {
+  prompt_tokens: 12, completion_tokens: 3, total_tokens: 15,
+}, { inputTokens: 12, outputTokens: 3, totalTokens: 15, cacheReadTokens: 0, cacheWriteTokens: 0 })
+await usageCase('cache split larger than the prompt is clamped', {
+  prompt_tokens: 100, completion_tokens: 5, total_tokens: 105, prompt_tokens_details: { cached_tokens: 150 },
+}, { inputTokens: 0, outputTokens: 5, totalTokens: 105, cacheReadTokens: 100, cacheWriteTokens: 0 })
+await usageCase('missing total is derived by the runtime', {
+  prompt_tokens: 40, completion_tokens: 2, prompt_tokens_details: { cached_tokens: 30 },
+}, { inputTokens: 10, outputTokens: 2, totalTokens: undefined, cacheReadTokens: 30, cacheWriteTokens: 0 })
+
 check('every site request refused redirects', redirectViolations === 0, redirectViolations)
 check('no plugin warnings', warnings.length === 0, warnings)
 finish()

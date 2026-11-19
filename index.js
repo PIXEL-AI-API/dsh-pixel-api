@@ -517,13 +517,39 @@ function mapFinishReason(reason) {
   }
 }
 
+// Wire usage → Harness TokenUsage. The site answers OpenAI-shaped usage for
+// every upstream: prompt_tokens counts the whole prompt INCLUDING cache reads
+// and writes, and prompt_tokens_details splits the cache out — cached_tokens
+// for reads; cache_write_tokens / cached_creation_tokens /
+// cache_creation_input_tokens for writes (one count under several names, so
+// the largest wins). DeepSeek-type channels may carry prompt_cache_hit_tokens
+// instead. usage_semantic 'anthropic' marks a prompt_tokens that already
+// excludes the cache.
+// The Harness wants disjoint buckets — inputTokens is the uncached remainder —
+// whose sum equals totalTokens - outputTokens; turn usage that breaks that
+// identity is discarded, so the split is clamped to the prompt and an
+// inconsistent provider total is left for the runtime to derive.
 function mapUsage(usage) {
+  const count = (value) => (Number.isSafeInteger(value) && value > 0 ? value : 0)
+  const details = usage.prompt_tokens_details ?? {}
+  const output = count(usage.completion_tokens)
+  let read = count(details.cached_tokens) || count(usage.prompt_cache_hit_tokens)
+  let write = Math.max(
+    count(details.cache_write_tokens),
+    count(details.cached_creation_tokens),
+    count(details.cache_creation_input_tokens),
+  )
+  const reported = count(usage.prompt_tokens)
+  const prompt = usage.usage_semantic === 'anthropic' ? reported + read + write : reported
+  read = Math.min(read, prompt)
+  write = Math.min(write, prompt - read)
+  const total = count(usage.total_tokens)
   return {
-    inputTokens: usage.prompt_tokens ?? 0,
-    outputTokens: usage.completion_tokens ?? 0,
-    totalTokens: usage.total_tokens ?? 0,
-    cacheReadTokens: usage.prompt_cache_hit_tokens ?? 0,
-    cacheWriteTokens: usage.prompt_cache_miss_tokens ?? 0,
+    inputTokens: prompt - read - write,
+    outputTokens: output,
+    ...(total === prompt + output ? { totalTokens: total } : {}),
+    cacheReadTokens: read,
+    cacheWriteTokens: write,
   }
 }
 
