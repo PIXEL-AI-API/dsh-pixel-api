@@ -11,6 +11,10 @@
   ],
   "license": "MIT",
   "author": "寇振琦",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PIXEL-AI-API/dsh-pixel-api.git"
+  },
   "type": "module",
   "main": "index.js",
   "icon": "./icon.svg",

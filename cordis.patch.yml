@@ -21,6 +21,11 @@
 # - contextWindows  per-model windows, e.g. { 'gemini-*': 1048576 }: an exact
 #                   model id or a `prefix*`, case-insensitive; both are also
 #                   editable on the settings page
+# - updateCheckAt / updateApplyAt   bumped by the settings page's 插件更新 card;
+#                   the host reads release tags with git (only then) and runs
+#                   the plugin manager's update, recording the outcome in
+#                   `update`. PIXEL_API_UPDATE_REPO overrides the repository a
+#                   non-Git copy reads tags from (a fork, or tests).
 # - refreshAt     bump to ask the plugin to refetch balance/groups
 # - signOutAt     bump to revoke the site session and clear local credentials
 #

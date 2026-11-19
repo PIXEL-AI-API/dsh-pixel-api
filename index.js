@@ -28,9 +28,10 @@
 // so instanceof checks (LlmError etc.) hold against the host's own copies.
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { createHash } from 'node:crypto'
-import { appendFileSync, mkdirSync, statSync, renameSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { appendFileSync, mkdirSync, readFileSync, statSync, renameSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { execFile } from 'node:child_process'
 
 // Opt-in local diagnostic trail (~/.dsh/pixel-api/debug.log), enabled by the
 // `debug` config field or PIXEL_API_DEBUG=1. Records control flow and HTTP
@@ -149,6 +150,163 @@ const Profile = z.object({
 // (MODEL_SWITCH_COMPACTION_FAILED) and never compacts automatically.
 const DEFAULT_CONTEXT_WINDOW = 272_000
 
+// ---------------------------------------------------------------------------
+// Self-update: stable release tags (vMAJOR.MINOR.PATCH) on the repository this
+// copy was installed from, applied through the Harness plugin manager — the
+// same replacement its Discover page performs for a Git-installed bundle.
+// ---------------------------------------------------------------------------
+
+const PACKAGE_NAME = 'dsh-pixel-api'
+// Where the check reads tags when this copy did not come from Git: a local
+// link or an npm copy cannot be updated from here, but the page still shows
+// the newest release. PIXEL_API_UPDATE_REPO points it elsewhere (a fork, or a
+// local repository in tests).
+const CANONICAL_REPOSITORY = process.env.PIXEL_API_UPDATE_REPO || 'https://github.com/PIXEL-AI-API/dsh-pixel-api'
+const UPDATE_CHECK_TIMEOUT_MS = 20_000
+const EMPTY_UPDATE = {
+  state: 'idle', message: '', current: '', latest: '', target: '', spec: '',
+  checkedAt: 0, servedCheckAt: 0, servedApplyAt: 0,
+}
+
+// The running copy's manifest version — the one updateBundle replaces.
+const OWN_VERSION = (() => {
+  try {
+    return String(JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? '')
+  } catch {
+    return ''
+  }
+})()
+
+const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/
+const FULL_COMMIT = /^[0-9a-f]{40}$/i
+const RELEASE_TAG = /^refs\/tags\/v(\d+\.\d+\.\d+)(\^\{\})?$/
+
+// Whether stable `candidate` is newer than `current` (which may be a prerelease).
+function newerRelease(candidate, current) {
+  const a = SEMVER.exec(candidate ?? '')
+  const b = SEMVER.exec(current ?? '')
+  if (!a || !b || a[4] !== undefined) return false
+  for (let i = 1; i <= 3; i++) {
+    if (Number(a[i]) !== Number(b[i])) return Number(a[i]) > Number(b[i])
+  }
+  return b[4] !== undefined
+}
+
+// The newest stable release among tag refs ([sha, ref] pairs). An annotated
+// tag lists its tag object and, as `^{}`, the commit it points to; a
+// lightweight tag lists the commit itself.
+function newestRelease(refs) {
+  const tags = new Map()
+  for (const [sha, ref] of refs) {
+    const match = RELEASE_TAG.exec(ref)
+    if (!match || !FULL_COMMIT.test(sha)) continue
+    const entry = tags.get(match[1]) ?? {}
+    entry[match[2] ? 'peeled' : 'direct'] = sha.toLowerCase()
+    tags.set(match[1], entry)
+  }
+  let newest
+  for (const [version, entry] of tags) {
+    if (newest === undefined || newerRelease(version, newest.version)) {
+      newest = { version, commit: entry.peeled ?? entry.direct }
+    }
+  }
+  return newest
+}
+
+// The repository a saved Git spec installs from, in a form `git ls-remote`
+// reads without credentials: host shortcuts and scp-like SSH become HTTPS.
+function repositoryOf(source) {
+  if (typeof source !== 'string') return undefined
+  const base = source.split('#')[0].trim()
+  const shortcut = /^(github|gitlab|bitbucket):(.+)$/i.exec(base)
+  if (shortcut) {
+    const host = { github: 'github.com', gitlab: 'gitlab.com', bitbucket: 'bitbucket.org' }[shortcut[1].toLowerCase()]
+    return `https://${host}/${shortcut[2].replace(/\.git$/i, '')}`
+  }
+  const url = base.replace(/^git\+/i, '')
+  const scp = /^(?:ssh:\/\/)?git@([^:/]+)[:/](.+)$/i.exec(url)
+  if (scp) return `https://${scp[1]}/${scp[2].replace(/\.git$/i, '')}`
+  if (/^https?:\/\//i.test(url)) return url.replace(/\.git$/i, '')
+  if (/^file:\/\//i.test(url)) return url
+  return undefined
+}
+
+// The update target: the installed copy's own saved spec with only the commit
+// replaced. The plugin manager accepts a Git update only for the same
+// repository and `path:` directory, and compares the repository path
+// case-sensitively, so the URL is never rebuilt.
+function retargetGitSpec(source, commit) {
+  const hash = source.indexOf('#')
+  if (hash === -1 || !FULL_COMMIT.test(commit)) return undefined
+  const paths = source.slice(hash + 1).split('&').filter((part) => part.startsWith('path:'))
+  return `${source.slice(0, hash)}#${[commit, ...paths].join('&')}`
+}
+
+// Tag refs through git, which carries the user's Git proxy and network
+// settings — the same path pnpm takes to fetch the update itself.
+function gitTagRefs(repository) {
+  return new Promise((resolve, reject) => {
+    execFile('git', ['-c', 'credential.helper=', '-c', 'core.askPass=', 'ls-remote', '--tags', '--', repository], {
+      timeout: UPDATE_CHECK_TIMEOUT_MS,
+      windowsHide: true,
+      maxBuffer: 1 << 20,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    }, (error, stdout) => {
+      if (error) {
+        reject(error)
+        return
+      }
+      resolve(String(stdout).split(/\r?\n/).map((line) => line.split('\t')).filter((parts) => parts.length === 2))
+    })
+  })
+}
+
+// The same ref advertisement over git's smart HTTP, for when git cannot run.
+async function httpTagRefs(repository) {
+  const res = await fetch(`${repository.replace(/\/+$/, '')}.git/info/refs?service=git-upload-pack`, {
+    headers: { 'user-agent': 'git/2.0 dsh-pixel-api' },
+    signal: AbortSignal.timeout(UPDATE_CHECK_TIMEOUT_MS),
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const buf = Buffer.from(await res.arrayBuffer())
+  const refs = []
+  for (let pos = 0; pos + 4 <= buf.length;) {
+    const length = Number.parseInt(buf.toString('ascii', pos, pos + 4), 16)
+    if (!Number.isFinite(length)) break
+    if (length < 4) {
+      pos += 4 // flush / delimiter packet
+      continue
+    }
+    const line = buf.toString('utf8', pos + 4, pos + length).replace(/\n$/, '')
+    pos += length
+    if (line.startsWith('#') || line.length < 42) continue
+    refs.push([line.slice(0, 40), line.slice(41).split('\0')[0]])
+  }
+  return refs
+}
+
+// One short line for the settings page; no URL user information can appear:
+// the plugin manager strips it from saved specs.
+function describeFailure(error) {
+  if (error?.code === 'ENOENT') return '找不到 git 命令'
+  if (error?.killed || error?.name === 'TimeoutError') return '连接超时'
+  const lines = String(error?.stderr || error?.message || error).split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+  return (lines.at(-1) ?? '未知原因').slice(0, 200)
+}
+
+async function remoteTagRefs(repository) {
+  try {
+    return await gitTagRefs(repository)
+  } catch (gitError) {
+    if (!/^https:\/\//i.test(repository)) throw gitError
+    try {
+      return await httpTagRefs(repository)
+    } catch (httpError) {
+      throw new Error(`git：${describeFailure(gitError)}；https：${describeFailure(httpError)}`)
+    }
+  }
+}
+
 export const Config = z.object({
   username: z.string().default('').volatile(),
   // Context window (tokens) declared to the Harness for PIXEL models.
@@ -175,6 +333,24 @@ export const Config = z.object({
     signOutAt: z.number().default(0),
     profile: Profile,
   }).default({ state: 'none', message: '', user: '', groups: [], groupCount: 0, models: -1, signOutAt: 0, profile: { ...EMPTY_PROFILE } }).volatile(),
+  // Settings page "检查更新" / "更新" bump these; the host serves each newer
+  // value once and records the served value in `update`.
+  updateCheckAt: z.number().default(0).volatile(),
+  updateApplyAt: z.number().default(0).volatile(),
+  // Host-written update status the settings page renders. The served stamps
+  // persist so a restart — including the one an update causes — never
+  // repeats a check or an update.
+  update: z.object({
+    state: z.string().default('idle'),
+    message: z.string().default(''),
+    current: z.string().default(''),
+    latest: z.string().default(''),
+    target: z.string().default(''),
+    spec: z.string().default(''),
+    checkedAt: z.number().default(0),
+    servedCheckAt: z.number().default(0),
+    servedApplyAt: z.number().default(0),
+  }).default({ ...EMPTY_UPDATE }).volatile(),
 })
 
 const SITE = 'https://api.ai-pixel.online'
@@ -922,6 +1098,21 @@ export function apply(ctx, config) {
     profile: normProfile(a?.profile),
   })
 
+  // Work started from apply() (inside a reload) or from loader/volatile-update
+  // (inside a settings commit) inherits the HMR service's `executing`
+  // AsyncLocalStorage, and anything that opens an HMR transaction — a
+  // configEditor edit, a plugin-manager update — then rejects with "HMR
+  // transactions cannot be nested". Leave that async context, the same escape
+  // HMR uses for its own config watcher; the operation is queued behind the
+  // running transaction. Nothing that transaction waits on awaits the result,
+  // so it cannot deadlock.
+  const outsideHmr = (fn) => {
+    const hmrExec = ctx.get('hmr')?.executing
+    return hmrExec && typeof hmrExec.exit === 'function' && hmrExec.getStore?.()
+      ? hmrExec.exit(fn)
+      : fn()
+  }
+
   // Host→config status writes go through the config editor seam: it validates,
   // persists to the profile patch, and commits volatile cells in place.
   // Identical status is never rewritten: each write fires volatile-update →
@@ -941,23 +1132,174 @@ export function apply(ctx, config) {
     }
     trace('writeAuth edit', { state: next.state, groupCount: next.groupCount, models: next.models,
       hasBalance: next.profile.balance !== '', profileAt: next.profile.updatedAt })
-    // Work started from apply() (inside a reload) or from loader/volatile-update
-    // (inside a settings commit) inherits the HMR service's `executing`
-    // AsyncLocalStorage, and configEditor.edit → hmr.runExclusive then rejects
-    // with "HMR transactions cannot be nested". Leave that async context —
-    // the same escape HMR uses for its own config watcher. The edit is then
-    // queued behind the running transaction; nothing awaits it, so it cannot
-    // deadlock the transaction.
-    const hmrExec = ctx.get('hmr')?.executing
-    const outside = (fn) => (hmrExec && typeof hmrExec.exit === 'function' && hmrExec.getStore?.()
-      ? hmrExec.exit(fn)
-      : fn())
-    outside(() => editor.edit(entry, (raw) => ({ ...(raw ?? {}), auth: next }))).then(
+    outsideHmr(() => editor.edit(entry, (raw) => ({ ...(raw ?? {}), auth: next }))).then(
       () => trace('writeAuth edit ok'),
       (err) => {
         trace('writeAuth edit FAILED', String(err?.message ?? err))
         ctx.logger.warn('pixel-api: status write failed:', err)
       })
+  }
+
+  // ---- self-update ------------------------------------------------------
+  // The settings page bumps updateCheckAt / updateApplyAt; this fiber serves
+  // each newer value once and records it in `update`. Nothing here touches the
+  // network unless the user asked for a check.
+  const normUpdate = (u) => ({
+    state: String(u?.state ?? 'idle'),
+    message: String(u?.message ?? ''),
+    current: String(u?.current ?? ''),
+    latest: String(u?.latest ?? ''),
+    target: String(u?.target ?? ''),
+    spec: String(u?.spec ?? ''),
+    checkedAt: Number(u?.checkedAt ?? 0) || 0,
+    servedCheckAt: Number(u?.servedCheckAt ?? 0) || 0,
+    servedApplyAt: Number(u?.servedApplyAt ?? 0) || 0,
+  })
+  const updateSection = () => {
+    const cfg = config ?? ctx.config ?? {}
+    return {
+      status: normUpdate(cell(cfg.update)),
+      checkAt: Number(cell(cfg.updateCheckAt) ?? 0) || 0,
+      applyAt: Number(cell(cfg.updateApplyAt) ?? 0) || 0,
+    }
+  }
+  // Same seam as writeAuth, but resolves to whether the status was persisted:
+  // an update must not start unless its record survives the removal of this
+  // copy, because the version that starts next reads it.
+  const writeUpdate = (patch) => {
+    const current = updateSection().status
+    const next = normUpdate({ ...current, ...patch, current: OWN_VERSION })
+    if (JSON.stringify(next) === JSON.stringify(current)) return Promise.resolve(true)
+    const editor = ctx.get('configEditor')
+    const entry = ctx.fiber?.entry
+    if (editor === undefined || entry === undefined) return Promise.resolve(false)
+    trace('writeUpdate', { state: next.state, latest: next.latest, target: next.target })
+    return outsideHmr(() => editor.edit(entry, (raw) => ({ ...(raw ?? {}), update: next }))).then(
+      () => true,
+      (err) => {
+        ctx.logger.warn('pixel-api: update status write failed:', err)
+        return false
+      })
+  }
+
+  const unsupportedReason = (manager, bundle) => {
+    if (manager === undefined) return '这个 Harness 没有插件管理服务，请手动更新'
+    if (bundle === undefined) return '插件管理里找不到 dsh-pixel-api'
+    if (bundle.update === 'registry') return '这份插件是从 npm 安装的，请在 插件 → 已安装 里更新'
+    if (typeof bundle.source === 'string' && /^(?:link|file):/i.test(bundle.source)) {
+      return '这份插件是从本地目录安装的，请在本地仓库更新代码'
+    }
+    return '安装来源没有固定到具体提交，请在 插件 页移除后，用 GitHub 地址重新添加'
+  }
+
+  const checkForUpdate = async () => {
+    const empty = { latest: '', target: '', spec: '' }
+    if (!SEMVER.test(OWN_VERSION)) return { ...empty, state: 'error', message: '读不到插件自己的版本号' }
+    const manager = ctx.get('pluginManager')
+    let bundle
+    if (manager !== undefined && typeof manager.listBundles === 'function') {
+      try {
+        bundle = (await outsideHmr(() => manager.listBundles())).find((item) => item?.name === PACKAGE_NAME)
+      } catch (error) {
+        trace('update listBundles FAILED', String(error?.message ?? error).slice(0, 200))
+      }
+    }
+    const fromGit = bundle?.update === 'git' && typeof bundle.source === 'string'
+    const repository = (fromGit ? repositoryOf(bundle.source) : undefined) ?? CANONICAL_REPOSITORY
+    let newest
+    try {
+      newest = newestRelease(await remoteTagRefs(repository))
+    } catch (error) {
+      return { ...empty, state: 'error', message: `读取 ${repository} 的版本失败：${describeFailure(error)}` }
+    }
+    // Up to date — including a build newer than every release tag.
+    if (newest === undefined || !newerRelease(newest.version, OWN_VERSION)) {
+      return { ...empty, state: 'latest', message: '', latest: OWN_VERSION }
+    }
+    const spec = fromGit ? retargetGitSpec(bundle.source, newest.commit) : undefined
+    if (spec === undefined) {
+      return { ...empty, state: 'unsupported', message: unsupportedReason(manager, bundle), latest: newest.version }
+    }
+    return { state: 'available', message: '', latest: newest.version, target: newest.version, spec }
+  }
+
+  const updateFailure = (outcome) => {
+    if (outcome?.error !== undefined) return describeFailure(outcome.error)
+    const result = outcome?.result
+    const reason = result?.error?.diagnostic || result?.error?.code || result?.packageResult?.kind || '未知原因'
+    return `${String(reason).slice(0, 200)}${outcome?.restore !== undefined ? '（已恢复原版本）' : ''}`
+  }
+
+  let updateRunning = false
+  const applyUpdate = async (status, applyAt) => {
+    const manager = ctx.get('pluginManager')
+    if (status.state !== 'available' || status.spec === '' || !newerRelease(status.target, OWN_VERSION)
+      || manager === undefined || typeof manager.updateBundle !== 'function') {
+      await writeUpdate({ state: 'error', message: '没有可以安装的新版本，请先检查更新', servedApplyAt: applyAt })
+      return
+    }
+    // Durable before anything is removed: the copy that starts next — the new
+    // version, or this one restored after a failure — settles the status.
+    const persisted = await writeUpdate({ state: 'updating', message: '', servedApplyAt: applyAt })
+    if (!persisted || disposed) return
+    updateRunning = true
+    let outcome
+    try {
+      outcome = await outsideHmr(() => manager.updateBundle(PACKAGE_NAME, status.target, {
+        spec: status.spec,
+        requestId: randomUUID(),
+      }))
+    } catch (error) {
+      outcome = { error }
+    } finally {
+      updateRunning = false
+    }
+    trace('update outcome', { step: outcome?.step, application: outcome?.result?.application, error: !!outcome?.error })
+    // With HMR the update removed this copy; the next start settles the status.
+    if (disposed) return
+    const application = outcome?.result?.application
+    if (application === 'restart-required') {
+      await writeUpdate({ state: 'restart', message: '' })
+    } else if (outcome?.error !== undefined || application === 'failed' || application === 'cancelled') {
+      await writeUpdate({ state: 'failed', message: updateFailure(outcome) })
+    }
+  }
+
+  const serveUpdate = async () => {
+    if (disposed) return
+    const { status, checkAt, applyAt } = updateSection()
+    // Settle what an earlier start left behind.
+    if (status.state === 'updating' && !updateRunning) {
+      await writeUpdate(status.target !== '' && status.target === OWN_VERSION
+        ? { state: 'updated', message: '', latest: OWN_VERSION, target: '', spec: '' }
+        : { state: 'failed', message: `更新没有完成，当前仍是 v${OWN_VERSION}，可以在 插件 页查看安装日志后重试` })
+    } else if (status.state === 'restart' && status.target === OWN_VERSION) {
+      await writeUpdate({ state: 'updated', message: '', latest: OWN_VERSION, target: '', spec: '' })
+    } else if (status.state === 'checking') {
+      await writeUpdate({ state: 'idle', message: '' })
+    } else if (status.state === 'available' && !newerRelease(status.latest, OWN_VERSION)) {
+      await writeUpdate({ state: 'latest', message: '', target: '', spec: '' })
+    } else if (status.current !== OWN_VERSION) {
+      await writeUpdate({})
+    }
+    if (checkAt > status.servedCheckAt) {
+      await writeUpdate({ state: 'checking', message: '', servedCheckAt: checkAt })
+      const result = await checkForUpdate()
+      if (disposed) return
+      await writeUpdate({ ...result, checkedAt: Date.now(), servedCheckAt: checkAt })
+    }
+    const now = updateSection().status
+    if (applyAt > now.servedApplyAt) await applyUpdate(now, applyAt)
+  }
+
+  let updateChain = Promise.resolve()
+  const reconcileUpdate = () => {
+    const run = updateChain.then(serveUpdate, serveUpdate)
+    updateChain = run.then(() => undefined, () => undefined)
+    run.catch((error) => {
+      trace('update FAILED', String(error?.message ?? error).slice(0, 300))
+      ctx.logger.warn('pixel-api: update handling failed:', error)
+    })
   }
 
   let registration
@@ -1585,7 +1927,10 @@ export function apply(ctx, config) {
 
   // Volatile commits fire loader/volatile-update on this fiber; credential
   // writes fire reference/record events. Both drive the same reconcile.
-  ctx.on('loader/volatile-update', () => reconcile())
+  ctx.on('loader/volatile-update', () => {
+    reconcile()
+    reconcileUpdate()
+  })
   ctx.on('credentials/reference-updated', (ref) => {
     // An explicit password (re)entry from the settings page is a deliberate
     // user retry — lift the automatic-login backoff for it.
@@ -1599,4 +1944,5 @@ export function apply(ctx, config) {
   ctx.on('credentials/record-updated', () => reconcile())
 
   reconcile()
+  reconcileUpdate()
 }

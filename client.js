@@ -92,6 +92,24 @@ window.__ModuleLoader__.load({
       'err.ctx.default': '默认窗口必须是大于 65536 的整数（Harness 压缩默认预留 65536 token）。',
       'err.ctx.line': '第 {line} 行格式不对：应为「模型 ID = token 数」，token 数须为大于 65536 的整数。',
       'err.ctx.star': '第 {line} 行：单独的 * 会覆盖所有模型，请直接修改默认窗口。',
+      'upd.title': '插件更新',
+      'upd.version': '当前版本 v{version}',
+      'upd.idle': '点「检查更新」会从 GitHub 读取最新版本，平时不会联网检查。',
+      'upd.checking': '正在检查更新…',
+      'upd.latest': '已是最新版本（v{version}）。',
+      'upd.available': '发现新版本 v{version}。',
+      'upd.availableHint': '更新时插件管理会先移除当前版本再安装新版本，期间 PIXEL 模型和这个页面会暂时消失；安装失败会自动恢复当前版本。',
+      'upd.unsupported': '最新版本是 v{version}，但这份插件不能在这里一键更新：{reason}。',
+      'upd.error': '检查更新失败：{reason}',
+      'upd.updating': '正在更新到 v{version}…完成后这个页面会自动恢复；如果一直没有恢复，请重启 DeepSeek Harness。',
+      'upd.updated': '已更新到 v{version}。',
+      'upd.restart': 'v{version} 已安装，重启 DeepSeek Harness 后生效。',
+      'upd.failed': '更新失败：{reason}',
+      'upd.checkedAt': '上次检查 {time}',
+      'upd.check': '检查更新',
+      'upd.apply': '更新到 v{version}',
+      'upd.confirm': '确认更新',
+      'upd.cancel': '取消',
     }
 
     const en = {
@@ -152,6 +170,24 @@ window.__ModuleLoader__.load({
       'err.ctx.default': 'The default window must be an integer above 65536 (Harness compaction reserves 65536 tokens by default).',
       'err.ctx.line': 'Line {line} is malformed: use "model ID = tokens" with an integer above 65536.',
       'err.ctx.star': 'Line {line}: a bare * would cover every model; change the default window instead.',
+      'upd.title': 'Plugin updates',
+      'upd.version': 'Version v{version}',
+      'upd.idle': 'Check for updates reads the newest version from GitHub; nothing is checked in the background.',
+      'upd.checking': 'Checking for updates…',
+      'upd.latest': 'You have the newest version (v{version}).',
+      'upd.available': 'Version v{version} is available.',
+      'upd.availableHint': 'The plugin manager removes this version, then installs the new one; PIXEL models and this page disappear meanwhile. A failed installation restores this version.',
+      'upd.unsupported': 'The newest version is v{version}, but this copy cannot be updated here: {reason}.',
+      'upd.error': 'Checking for updates failed: {reason}',
+      'upd.updating': 'Updating to v{version}… This page comes back when it finishes; restart DeepSeek Harness if it does not.',
+      'upd.updated': 'Updated to v{version}.',
+      'upd.restart': 'v{version} is installed and takes effect after restarting DeepSeek Harness.',
+      'upd.failed': 'The update failed: {reason}',
+      'upd.checkedAt': 'Last checked {time}',
+      'upd.check': 'Check for updates',
+      'upd.apply': 'Update to v{version}',
+      'upd.confirm': 'Confirm update',
+      'upd.cancel': 'Cancel',
     }
 
     // Inline SVG Icons
@@ -912,6 +948,86 @@ window.__ModuleLoader__.load({
       )
     }
 
+    const RefreshIcon = () => h('svg', { width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' },
+      h('polyline', { points: '23 4 23 10 17 10' }),
+      h('path', { d: 'M20.49 15a9 9 0 1 1-2.12-9.36L23 10' })
+    )
+
+    // Plugin updates. The host does the work (it reads release tags with git
+    // and runs the plugin manager's update); this card only bumps
+    // updateCheckAt / updateApplyAt and renders the `update` status the host
+    // writes back. Nothing is checked unless the person asks.
+    function UpdateCard(props) {
+      const { api, t, section, reload } = props
+      const u = (section && section.update) || {}
+      const state = String(u.state || 'idle')
+      const [confirming, setConfirming] = useState(false)
+      const [sent, setSent] = useState(null)
+      const [error, setError] = useState(null)
+      // A request is pending until the host records serving it.
+      const servedFor = (kind) => Number(kind === 'check' ? u.servedCheckAt : u.servedApplyAt) || 0
+      const pending = sent !== null && sent.at > servedFor(sent.kind)
+      useEffect(() => {
+        if (!pending) return undefined
+        // Poll as well, in case no settings/document-updated event reaches this page.
+        const poll = setInterval(() => { if (typeof reload === 'function') void reload() }, 2000)
+        const giveUp = setTimeout(() => setSent(null), 30000)
+        return () => { clearInterval(poll); clearTimeout(giveUp) }
+      }, [pending, reload])
+      const busy = pending || state === 'checking' || state === 'updating'
+      const request = (kind) => {
+        const at = Date.now()
+        setError(null)
+        setConfirming(false)
+        setSent({ kind, at })
+        api.settings.mutate(NS, [{ op: 'set', path: [kind === 'check' ? 'updateCheckAt' : 'updateApplyAt'], value: at }])
+          .catch((e) => { setSent(null); setError(msg(e)) })
+      }
+
+      const reason = u.message || '—'
+      let line = t('upd.idle')
+      let tone = null
+      if (state === 'checking' || (pending && sent && sent.kind === 'check')) line = t('upd.checking')
+      else if (state === 'latest') line = fillText(t, 'upd.latest', { version: u.latest || u.current })
+      else if (state === 'available') { line = fillText(t, 'upd.available', { version: u.latest }); tone = 'info' }
+      else if (state === 'unsupported') { line = fillText(t, 'upd.unsupported', { version: u.latest, reason }); tone = 'warn' }
+      else if (state === 'error') { line = fillText(t, 'upd.error', { reason }); tone = 'err' }
+      else if (state === 'updating') { line = fillText(t, 'upd.updating', { version: u.target }); tone = 'info' }
+      else if (state === 'updated') { line = fillText(t, 'upd.updated', { version: u.current }); tone = 'info' }
+      else if (state === 'restart') { line = fillText(t, 'upd.restart', { version: u.target }); tone = 'warn' }
+      else if (state === 'failed') { line = fillText(t, 'upd.failed', { reason }); tone = 'err' }
+      const checkedAt = Number(u.checkedAt) || 0
+      const available = state === 'available' && !!u.latest
+
+      return h('div', { className: 'pxa-card' },
+        h('div', { className: 'pxa-card-head' },
+          h('div', { className: 'pxa-card-title' }, h(RefreshIcon, null), t('upd.title')),
+          u.current ? h('span', { className: 'pxa-hint' }, fillText(t, 'upd.version', { version: u.current })) : null,
+        ),
+        tone ? h('div', { className: 'pxa-banner ' + tone }, line) : h('p', { className: 'pxa-desc' }, line),
+        available ? h('p', { className: 'pxa-hint' }, t('upd.availableHint')) : null,
+        error ? h('div', { className: 'pxa-banner err' }, error) : null,
+        h('div', { className: 'pxa-actions' },
+          available && confirming
+            ? h(React.Fragment, null,
+              h('button', { className: 'pxa-btn primary', disabled: busy, onClick: () => request('apply') }, t('upd.confirm')),
+              h('button', { className: 'pxa-btn', disabled: busy, onClick: () => setConfirming(false) }, t('upd.cancel')))
+            : available
+              ? h('button', { className: 'pxa-btn primary', disabled: busy, onClick: () => setConfirming(true) },
+                fillText(t, 'upd.apply', { version: u.latest }))
+              : null,
+          !(available && confirming)
+            ? h('button', { className: 'pxa-btn', disabled: busy, onClick: () => request('check') }, t('upd.check'))
+            : null,
+          checkedAt > 0 && !busy
+            ? h('span', { className: 'pxa-hint' }, fillText(t, 'upd.checkedAt', {
+              time: new Date(checkedAt).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }),
+            }))
+            : null,
+        ),
+      )
+    }
+
     function PixelSection(props) {
       const { api, remote, t } = props
       const [view, setView] = useState({ status: 'loading', error: null, section: null, creds: {} })
@@ -1200,6 +1316,7 @@ window.__ModuleLoader__.load({
         : profile.updatedAt
           ? fill('ok.updated', { time: new Date(profile.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) })
           : ''
+      const updateCard = h(UpdateCard, { api, t, section: view.section, reload: load })
       const statusCard = h(React.Fragment, null,
         h('div', { className: 'pxa-card pxa-id-card' },
           h('div', { className: 'pxa-avatar' }, userInitial),
@@ -1240,6 +1357,7 @@ window.__ModuleLoader__.load({
           ),
         ),
         h(ContextCard, { api, t, section: view.section, reload: load }),
+        updateCard,
         h('div', { className: 'pxa-footer' },
           h('span', null, groupCount > 0
             ? (modelCount >= 0
@@ -1267,6 +1385,7 @@ window.__ModuleLoader__.load({
 
       if (auth.state === '2fa') {
         elements.push(h(React.Fragment, { key: 'otp-card' }, otpCard))
+        elements.push(h(React.Fragment, { key: 'update-card' }, updateCard))
       } else if (auth.state === 'ok') {
         elements.push(h(React.Fragment, { key: 'status-card' }, statusCard))
       } else {
@@ -1278,6 +1397,7 @@ window.__ModuleLoader__.load({
           elements.push(h('div', { key: 'auth-msg', className: 'pxa-banner info' }, auth.message))
         }
         elements.push(h(React.Fragment, { key: 'login-card' }, formCard))
+        elements.push(h(React.Fragment, { key: 'update-card' }, updateCard))
       }
 
       return h('div', { className: 'pxa-section' }, elements)

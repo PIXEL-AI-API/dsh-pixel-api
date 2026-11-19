@@ -138,7 +138,7 @@ const loaders = []
 const sandbox = {
   window: { __ModuleLoader__: { load: (definition) => loaders.push(definition) }, addEventListener() {}, removeEventListener() {} },
   document: { getElementById: () => null, createElement: () => ({ remove() {} }), head: { appendChild() {} }, addEventListener() {}, removeEventListener() {} },
-  queueMicrotask, setTimeout, clearTimeout, console,
+  queueMicrotask, setTimeout, clearTimeout, setInterval, clearInterval, console,
 }
 sandbox.globalThis = sandbox
 vm.createContext(sandbox)
@@ -161,17 +161,24 @@ let section = {
 }
 const mutations = []
 const ok = (value) => ({ ok: true, value })
+// Like the real wire: a committed mutation announces settings/document-updated.
+const listeners = new Map()
+const emit = (name) => { for (const fn of listeners.get(name) ?? []) fn() }
 const remote = {
   settings: {
     describe: async () => ok({ namespaces: [{ ns: NS, value: section }] }),
     mutate: async (ns, ops) => {
       mutations.push({ ns, ops })
       for (const op of ops) section = { ...section, [op.path[0]]: op.value }
+      setTimeout(() => emit('settings/document-updated'), 0)
       return ok(undefined)
     },
   },
   credentials: { describe: async () => ok({}), set: async () => ok(undefined), unset: async () => ok(undefined) },
-  $on: () => () => {},
+  $on: (name, fn) => {
+    listeners.set(name, [...(listeners.get(name) ?? []), fn])
+    return () => listeners.set(name, (listeners.get(name) ?? []).filter((f) => f !== fn))
+  },
 }
 const dicts = {}
 const registrations = []
@@ -194,8 +201,8 @@ const props = page.options.inject()
 const t = props.t
 const zh = dicts[NS].zh
 const en = dicts[NS].en
-const missing = Object.keys(zh).filter((k) => k.startsWith('ctx.') || k.startsWith('err.ctx.')).filter((k) => !(k in en))
-check('every ctx string has an English entry', missing.length === 0, missing)
+const missing = Object.keys(zh).filter((k) => /^(ctx|err\.ctx|upd)\./.test(k)).filter((k) => !(k in en))
+check('every ctx/upd string has an English entry', missing.length === 0, missing)
 
 // --- drive the card ----------------------------------------------------------
 const find = (pred) => renderer.elements.find(pred)
@@ -249,6 +256,48 @@ check('restore defaults writes 272000 and no rules',
   && JSON.stringify(reset.ops.find((o) => o.path[0] === 'contextWindows')?.value) === '{}', reset)
 check('form follows the restored value', input()?.props.value === '272000' && textarea()?.props.value === '', [input()?.props.value, textarea()?.props.value])
 check('no render errors after interaction', renderer.errors.length === 0, renderer.errors)
+
+// --- the update card ---------------------------------------------------------
+log('Update card')
+const hostWrites = async (update) => {
+  section = { ...section, update: { state: 'idle', message: '', current: '0.2.3', latest: '', target: '', spec: '', checkedAt: 0, servedCheckAt: 0, servedApplyAt: 0, ...update } }
+  emit('settings/document-updated')
+  await renderer.settle(page.component, props)
+}
+const lastOp = () => mutations.at(-1)?.ops?.[0]
+await hostWrites({})
+check('card shows the running version', renderer.text.includes(t('upd.title')) && renderer.text.includes('v0.2.3'), renderer.text.slice(-400))
+check('idle: says nothing is checked in the background', renderer.text.includes(t('upd.idle')))
+check('idle: no update button', button(t('upd.apply').replace('{version}', '0.2.4')) === undefined)
+await click(t('upd.check'))
+const checkOp = lastOp()
+check('检查更新 bumps updateCheckAt', checkOp?.path?.[0] === 'updateCheckAt' && Number.isFinite(checkOp.value), checkOp)
+check('pending check shows progress and disables the button',
+  renderer.text.includes(t('upd.checking')) && button(t('upd.check'))?.props.disabled === true)
+await hostWrites({ state: 'available', latest: '0.2.4', target: '0.2.4', spec: 'git+https://github.com/PIXEL-AI-API/dsh-pixel-api.git#' + 'a'.repeat(40), checkedAt: Date.now(), servedCheckAt: checkOp.value })
+const applyLabel = t('upd.apply').replace('{version}', '0.2.4')
+check('available: offers the new version and explains what happens',
+  renderer.text.includes(t('upd.available').replace('{version}', '0.2.4')) && renderer.text.includes(t('upd.availableHint')) && button(applyLabel) !== undefined)
+const beforeApply = mutations.length
+await click(applyLabel)
+check('first click only asks for confirmation', mutations.length === beforeApply && button(t('upd.confirm')) !== undefined && button(t('upd.cancel')) !== undefined)
+await click(t('upd.cancel'))
+check('cancel returns to the offer without writing', mutations.length === beforeApply && button(applyLabel) !== undefined)
+await click(applyLabel)
+await click(t('upd.confirm'))
+const applyOp = lastOp()
+check('confirm bumps updateApplyAt', mutations.length === beforeApply + 1 && applyOp?.path?.[0] === 'updateApplyAt' && Number.isFinite(applyOp.value), applyOp)
+await hostWrites({ state: 'updating', latest: '0.2.4', target: '0.2.4', servedCheckAt: checkOp.value, servedApplyAt: applyOp.value })
+check('updating: progress shown, every button disabled',
+  renderer.text.includes(t('upd.updating').replace('{version}', '0.2.4')) && button(t('upd.check'))?.props.disabled === true)
+await hostWrites({ state: 'unsupported', latest: '0.2.4', message: '这份插件是从本地目录安装的，请在本地仓库更新代码' })
+check('unsupported: newest version and the reason, no update button',
+  renderer.text.includes('v0.2.4') && renderer.text.includes('本地目录') && button(applyLabel) === undefined)
+await hostWrites({ state: 'failed', message: 'pnpm failed（已恢复原版本）' })
+check('failed: the reason is shown', renderer.text.includes('pnpm failed（已恢复原版本）'))
+await hostWrites({ state: 'updated', current: '0.2.4' })
+check('updated: says which version is running', renderer.text.includes(t('upd.updated').replace('{version}', '0.2.4')))
+check('no render errors in the update card', renderer.errors.length === 0, renderer.errors)
 
 log(failures === 0 ? 'ALL OK' : `${failures} FAILED`)
 if (process.argv[2]) writeFileSync(process.argv[2], lines.join('\n'))
