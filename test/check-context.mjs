@@ -1,8 +1,11 @@
 // Host-half check: declared context capacity, error classification (HTTP
-// errors and stream error frames), session refresh failures, site call
-// timeouts, the wire shape of tool results, and the site's replay data
-// (capture, send-back rules, and a round trip through the agent loop's own
-// assembly).
+// errors and stream error frames), usage mapping, session refresh failures,
+// site call timeouts, the wire shape of tool results, and the site's replay
+// data (capture, send-back rules, and a round trip through the agent loop's
+// own assembly); then the sign-in lifecycle: going back from the 2FA step, a
+// rotated refresh cookie the credential store cannot keep, route names that
+// follow the site, a profile without the attachment service, and a chat 401
+// landing while a reconcile is in flight.
 // Boots the real plugin module against the real LlmRuntime with a fake ctx and
 // a mocked PIXEL site — no network, no credentials, nothing billed.
 //
@@ -64,6 +67,12 @@ check('rejects a non-numeric contextWindow', rejects({ contextWindow: '272k' }))
 check('rejects a fractional contextWindow', rejects({ contextWindow: 1.5 }))
 check('rejects a negative per-model window', rejects({ contextWindows: { x: -5 } }))
 check('rejects a non-boolean openaiReasoningReplay', rejects({ openaiReasoningReplay: 'yes' }))
+// The window floor is applied where the window is declared, never by the
+// schema: a profile already holding a smaller window must keep loading.
+check('still accepts a window under the floor (a profile holding one loads)',
+  !rejects({ contextWindow: 100 }) && !rejects({ contextWindows: { x: 1000 } }))
+check('default cancelChallengeAt is 0, a live cell', read(defaults.cancelChallengeAt) === 0
+  && typeof defaults.cancelChallengeAt?.[WRITE] === 'function', read(defaults.cancelChallengeAt))
 
 // ---------------------------------------------------------------------------
 // Mocked site. Every request must refuse redirects (index.js siteFetch).
@@ -82,12 +91,19 @@ const sse = (events, headers = {}) => new Response(new ReadableStream({
   },
 }), { status: 200, headers: { 'content-type': 'text/event-stream', ...headers } })
 // The site's session bundle: what a refresh, a login and a 2FA check return.
+// Each one carries a token of its own, as the site's do.
+let bundlesIssued = 0
 const sessionBundle = () => ({
-  access_token: 'mock-access-token',
+  access_token: `mock-access-token-${++bundlesIssued}`,
   access_expires_at: Math.floor(Date.now() / 1000) + 3600,
   session: { sid: 'sid-1' },
   user: { username: 'tester' },
 })
+// The same bundle with the refresh cookie the site rotates on every session it
+// issues (new-api-main service/auth_session.go: WriteRefreshCookie).
+let cookiesRotated = 0
+const rotatedBundle = () => json({ success: true, data: sessionBundle() }, 200,
+  { 'set-cookie': `new_api_refresh=rotated-${++cookiesRotated}; Path=/; HttpOnly; SameSite=Strict` })
 // A site that stops answering, the way undici reports it: the request (or,
 // once its headers arrived, the body read) fails with the reason of the signal
 // the caller passed, when that signal fires. A request without a signal would
@@ -142,16 +158,21 @@ const refreshReply = (init) => {
         { status: 502, headers: { 'content-type': 'text/html' } })
     case '401':
       return json({ success: false, code: 'AUTH_SESSION_REVOKED', message: 'Unauthorized' }, 401)
+    case 'rotate':
+      return rotatedBundle()
     default:
       return json({ success: true, data: sessionBundle() })
   }
 }
-// Sign-in outcomes, switched per case. A login answers a session, a 2FA
-// challenge or a refusal (HTTP 200 with success:false, as new-api answers a
-// wrong password), or hangs; the 2FA check and the logout answer or hang.
+// Sign-in outcomes, switched per case. A login answers a session (with or
+// without the rotated cookie), a 2FA challenge or a refusal (HTTP 200 with
+// success:false, as new-api answers a wrong password), or hangs; the 2FA check
+// answers a session (with or without the cookie) or hangs; the logout answers
+// or hangs.
 let loginMode = 'ok'
 let verifyMode = 'ok'
 let logoutMode = 'ok'
+let challengesIssued = 0
 const loginReply = (init) => {
   switch (loginMode) {
     case 'hang':
@@ -159,21 +180,42 @@ const loginReply = (init) => {
     case 'reject':
       return json({ success: false, message: '用户名或密码错误，或用户已被封禁' })
     case '2fa':
-      return json({ success: true, data: { require_verification: true, flow_token: 'flow-1' } })
+      return json({ success: true, data: { require_verification: true, flow_token: `flow-${++challengesIssued}` } })
+    case 'rotate':
+      return rotatedBundle()
     default:
       return json({ success: true, data: sessionBundle() })
   }
 }
+const verifyReply = (init) => {
+  switch (verifyMode) {
+    case 'hang':
+      return hang('/api/user/login/verify', init)
+    case 'rotate':
+      return rotatedBundle()
+    default:
+      return json({ success: true, data: sessionBundle() })
+  }
+}
+// The group list, switched per case; a set gate holds its answer until opened.
+const DEFAULT_GROUPS = { 'room-1024': { is_room: true, room_name: 'Room 1024', ratio: 0.5, kind: 'pool' }, default: { ratio: 1 } }
+let siteGroups = DEFAULT_GROUPS
+let groupsGate
 let redirectViolations = 0
-// Every /api/* request, and whether it carried an abort signal: index.js
-// bounds each site call (/pg/chat/completions has its idle watchdog instead).
+// Every /api/* request, whether it carried an abort signal (index.js bounds
+// each site call; /pg/chat/completions has its idle watchdog instead), and the
+// Authorization it sent.
 const apiCalls = []
 globalThis.fetch = async (url, init = {}) => {
   const target = new URL(String(url))
   if (target.origin !== SITE) throw new Error(`unexpected host ${target.origin}`)
   if (init.redirect !== 'error') redirectViolations += 1
   if (target.pathname.startsWith('/api/')) {
-    apiCalls.push({ path: target.pathname, signalled: init.signal instanceof AbortSignal })
+    apiCalls.push({
+      path: target.pathname,
+      signalled: init.signal instanceof AbortSignal,
+      authorization: new Headers(init.headers ?? {}).get('authorization'),
+    })
   }
   switch (target.pathname) {
     case '/api/user/auth/refresh':
@@ -181,11 +223,12 @@ globalThis.fetch = async (url, init = {}) => {
     case '/api/user/login':
       return loginReply(init)
     case '/api/user/login/verify':
-      return verifyMode === 'hang' ? hang(target.pathname, init) : json({ success: true, data: sessionBundle() })
+      return verifyReply(init)
     case '/api/user/auth/logout':
       return logoutMode === 'hang' ? hang(target.pathname, init) : json({ success: true })
     case '/api/user/self/groups':
-      return json({ success: true, data: { 'room-1024': { is_room: true, room_name: 'Room 1024', ratio: 0.5, kind: 'pool' }, default: { ratio: 1 } } })
+      if (groupsGate !== undefined) await groupsGate
+      return json({ success: true, data: siteGroups })
     case '/api/pricing':
       return json({
         success: true,
@@ -199,9 +242,11 @@ globalThis.fetch = async (url, init = {}) => {
       return json({ success: true, data: { quota_per_unit: 500000, quota_display_type: 'USD' } })
     case '/api/user/self':
       return json({ success: true, data: { id: 7, username: 'tester', quota: 500000, used_quota: 1000, request_count: 3, group: 'default' } })
-    case '/pg/chat/completions':
-      chatBodies.push(JSON.parse(init.body))
-      return chat()
+    case '/pg/chat/completions': {
+      const body = JSON.parse(init.body)
+      chatBodies.push(body)
+      return chat(body, init)
+    }
     default:
       return json({ success: false, message: `unexpected ${target.pathname}` }, 404)
   }
@@ -218,10 +263,15 @@ const warnings = []
 // image fails its request when it does.
 const noImages = async () => { throw new Error('no images in this check') }
 let readImageRequest = noImages
+// Each refused credential write names another temp file, as the local store's
+// writeFileAtomic does (dsh-atomic-write: `<file>.<random>.tmp`).
+let refusedWrites = 0
 // A fake ctx around one real LlmRuntime; `edit` receives the status writes.
 // Given `listeners`, the event handlers the plugin registers are kept there so
-// a check can fire them the way the host's events do.
-const fakeCtxFor = ({ runtime, credentials, warnings, registered, edit = async () => {}, listeners }) => ({
+// a check can fire them the way the host's events do. `attachments: false`
+// mounts no attachment service; a ref in `failingWrites` makes the credential
+// store refuse to set it.
+const fakeCtxFor = ({ runtime, credentials, warnings, registered, edit = async () => {}, listeners, attachments = true, failingWrites }) => ({
   logger: { warn: (...parts) => warnings.push(parts.map(String).join(' ')), info() {}, debug() {}, error() {} },
   effect(fn) { fn(); return () => {} },
   on(name, listener) {
@@ -233,12 +283,19 @@ const fakeCtxFor = ({ runtime, credentials, warnings, registered, edit = async (
     if (name === 'credentials') {
       return {
         resolve: async (ref) => (credentials.has(ref) ? { value: credentials.get(ref) } : undefined),
-        set: async (ref, value) => { credentials.set(ref, value) },
+        set: async (ref, value) => {
+          if (failingWrites?.has(ref)) {
+            throw new Error(`EPERM: operation not permitted, open 'credentials.env.${++refusedWrites}.tmp'`)
+          }
+          credentials.set(ref, value)
+        },
         unset: async (ref) => { credentials.delete(ref) },
       }
     }
     if (name === 'configEditor') return { edit }
-    if (name === 'attachments') return { readImageRequest: (ref, target) => readImageRequest(ref, target) }
+    if (name === 'attachments') {
+      return attachments ? { readImageRequest: (ref, target) => readImageRequest(ref, target) } : undefined
+    }
     return undefined
   },
   fiber: { entry: { id: 'pixel-api' } },
@@ -299,6 +356,18 @@ await expectWindow('live default edit', 'pixel/default', 'gpt-6.2-sol', 300000)
 await expectWindow('live override removal', 'pixel/room-1024', 'gemini-4-hydrogen', 300000)
 config.contextWindow?.[WRITE]?.(0)
 await expectWindow('invalid default falls back', 'pixel/room-1024', 'gemini-4-hydrogen', 272000)
+// A positive window under the settings page's minimum (65537), as a direct
+// config edit leaves it, is declared at that minimum — per model too, where it
+// still wins over the default; one at the minimum is kept.
+config.contextWindow?.[WRITE]?.(100)
+await expectWindow('default under the floor is raised to 65537', 'pixel/default', 'gpt-6.2-sol', 65537)
+config.contextWindow?.[WRITE]?.(65536)
+await expectWindow('default of 65536 (compaction headroom) is raised to 65537', 'pixel/default', 'gpt-6.2-sol', 65537)
+config.contextWindow?.[WRITE]?.(272000)
+config.contextWindows?.[WRITE]?.({ 'tiny-model': 1000, 'floor-*': 65537 })
+await expectWindow('exact override under the floor is raised, not skipped', 'pixel/default', 'tiny-model', 65537)
+await expectWindow('prefix override at the floor is kept', 'pixel/default', 'floor-1', 65537)
+config.contextWindows?.[WRITE]?.({})
 config.contextWindow?.[WRITE]?.(272000)
 
 // ---------------------------------------------------------------------------
@@ -475,12 +544,14 @@ for (const [label, responder, code] of requestIdCases) {
 // gemini_chat/to_oai_chat_resp.go, OpenAI passthrough, DeepSeek-type hit/miss).
 log('Usage mapping (cache buckets the client turns into a hit rate)')
 // Mirror of dsh-token-meter src/turn-usage.ts normalizeUsage (lines 85-113):
-// usage that fails it is dropped from turn usage.
+// usage that fails it is dropped from turn usage. reasoningTokens is the part
+// of outputTokens spent reasoning, never more.
 const keptByTurnUsage = (u) => {
   const isCount = (v) => Number.isSafeInteger(v) && v >= 0
   if (!isCount(u.inputTokens) || !isCount(u.outputTokens)) return false
   if (u.cacheReadTokens !== undefined && !isCount(u.cacheReadTokens)) return false
   if (u.cacheWriteTokens !== undefined && !isCount(u.cacheWriteTokens)) return false
+  if (u.reasoningTokens !== undefined && (!isCount(u.reasoningTokens) || u.reasoningTokens > u.outputTokens)) return false
   const known = u.inputTokens + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0)
   if (u.totalTokens === undefined) return u.cacheReadTokens !== undefined && u.cacheWriteTokens !== undefined
   const exact = u.totalTokens - u.outputTokens
@@ -492,7 +563,7 @@ const sessionHit = (u) => (100 * u.cacheReadTokens) / (u.inputTokens + u.cacheRe
 const usageCase = async (label, wire, expected) => {
   const got = (await run(() => sse([choice({ content: 'ok' }), choice({}, 'stop'), { choices: [], usage: wire }, '[DONE]'])))
     .find((c) => c.type === 'usage')?.usage
-  const fields = ['inputTokens', 'outputTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens']
+  const fields = ['inputTokens', 'outputTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens']
   const same = got !== undefined && fields.every((k) => got[k] === expected[k])
   check(`${label}`, same && keptByTurnUsage(got), { got, expected })
   return got
@@ -528,6 +599,21 @@ await usageCase('cache split larger than the prompt is clamped', {
 await usageCase('missing total is derived by the runtime', {
   prompt_tokens: 40, completion_tokens: 2, prompt_tokens_details: { cached_tokens: 30 },
 }, { inputTokens: 10, outputTokens: 2, totalTokens: undefined, cacheReadTokens: 30, cacheWriteTokens: 0 })
+// Reasoning: completion_tokens already counts it (relaykit gemini_chat
+// to_oai_chat_resp.go adds ThoughtsTokenCount in), and the site always sends
+// completion_tokens_details, with reasoning_tokens 0 when the upstream does not
+// break it out (Claude).
+await usageCase('Gemini thinking via site: thoughts as reasoningTokens, inside an unchanged output', {
+  prompt_tokens: 5000, completion_tokens: 350, total_tokens: 5350, prompt_tokens_details: { cached_tokens: 4096 },
+  completion_tokens_details: { text_tokens: 0, audio_tokens: 0, image_tokens: 0, reasoning_tokens: 300 },
+}, { inputTokens: 904, outputTokens: 350, totalTokens: 5350, cacheReadTokens: 4096, cacheWriteTokens: 0, reasoningTokens: 300 })
+await usageCase('reasoning_tokens 0 (not broken out upstream): no reasoningTokens', {
+  prompt_tokens: 12, completion_tokens: 3, total_tokens: 15,
+  completion_tokens_details: { text_tokens: 0, audio_tokens: 0, image_tokens: 0, reasoning_tokens: 0 },
+}, { inputTokens: 12, outputTokens: 3, totalTokens: 15, cacheReadTokens: 0, cacheWriteTokens: 0 })
+await usageCase('reasoning above the output is left out, the rest of the usage kept', {
+  prompt_tokens: 12, completion_tokens: 3, total_tokens: 15, completion_tokens_details: { reasoning_tokens: 9 },
+}, { inputTokens: 12, outputTokens: 3, totalTokens: 15, cacheReadTokens: 0, cacheWriteTokens: 0 })
 
 // ---------------------------------------------------------------------------
 // Harness 0.2.2-rc.3 history: each tool result is its own role:'tool' message.
@@ -1039,19 +1125,24 @@ const until = async (condition, tries = 100) => {
 // Lets the plugin's queued promise work run to its end.
 const drain = () => new Promise((r) => realSetTimeout(r, 0))
 // `refreshCookie` undefined: no session stored yet; `password`: a sign-in the
-// settings page submitted. The credential store here fires no events of its
-// own: `emit` runs the handlers the plugin registered for one host event.
-const bootInstance = async (refreshCookie, { password } = {}) => {
+// settings page submitted; `config`: more of the stored plugin config (a
+// reload); `attachments` and `failingWrites` as for fakeCtxFor, the latter
+// kept as a Set a check can change. The credential store here fires no events
+// of its own: `emit` runs the handlers the plugin registered for one host event.
+const bootInstance = async (refreshCookie, { password, config: stored = {}, attachments = true, failingWrites = [] } = {}) => {
   const instanceApp = new Context()
   await instanceApp.plugin(LlmRuntime)
-  const instanceConfig = plugin.Config({ username: 'tester' })
+  const instanceConfig = plugin.Config({ username: 'tester', ...stored })
   const listeners = new Map()
   const instance = {
+    app: instanceApp,
+    llm: instanceApp.get('llm'),
     config: instanceConfig,
     credentials: new Map([
       ...(refreshCookie === undefined ? [] : [['PIXEL_API_REFRESH', refreshCookie]]),
       ...(password === undefined ? [] : [['PIXEL_API_PASSWORD', password]]),
     ]),
+    failingWrites: new Set(failingWrites),
     warnings: [],
     registered: [],
     statuses: [],
@@ -1069,12 +1160,14 @@ const bootInstance = async (refreshCookie, { password } = {}) => {
     instanceConfig.auth[WRITE](auth)
   }
   plugin.apply(fakeCtxFor({
-    runtime: instanceApp.get('llm'),
+    runtime: instance.llm,
     credentials: instance.credentials,
     warnings: instance.warnings,
     registered: instance.registered,
     edit,
     listeners,
+    attachments,
+    failingWrites: instance.failingWrites,
   }), instanceConfig)
   return instance
 }
@@ -1238,6 +1331,311 @@ logoutMode = 'ok'
 AbortSignal.timeout = realAbortTimeout
 globalThis.setTimeout = realSetTimeout
 globalThis.clearTimeout = realClearTimeout
+
+// ---------------------------------------------------------------------------
+// The checks below run on real timers again. `settle` waits out a pass that
+// changes nothing visible: its work here is mock calls and promise turns.
+const settle = () => new Promise((r) => realSetTimeout(r, 200))
+const verifyCalls = () => apiCalls.filter((call) => call.path === '/api/user/login/verify').length
+const refreshCalls = () => apiCalls.filter((call) => call.path === '/api/user/auth/refresh').length
+const groupFetches = () => apiCalls.filter((call) => call.path === '/api/user/self/groups').length
+// One request through an instance's own runtime.
+const streamOn = async (instance, responder, messages = [userSays('hi')]) => {
+  chat = responder
+  const collected = []
+  for await (const chunk of instance.llm.stream({ ...ROUTE, messages })) collected.push(chunk)
+  return collected
+}
+const turnedDown = () => json({ error: siteError('', 'new_api_error', '未登录或登录已过期') }, 401)
+
+// ---------------------------------------------------------------------------
+// "返回" on the 2FA step bumps cancelChallengeAt. The host drops the pending
+// challenge ahead of its challenge branch, which would otherwise put the 2FA
+// step straight back and take the next password as its own. Each value is
+// served once — a repeated or older one cancels nothing, after a reload too —
+// and with no challenge pending it is only recorded.
+log('2FA: 返回 from the code step (cancelChallengeAt)')
+loginMode = '2fa'
+const backing = await bootInstance(undefined, { password: 'pw-7' })
+await until(() => backing.status()?.state === '2fa')
+check('setup: the sign-in stops at the 2FA step', backing.status()?.state === '2fa', backing.status())
+// A code and a password are stored, but 返回 is pressed before the host acts
+// on them (no credential event fired for either).
+backing.credentials.set('PIXEL_API_2FA', '111111')
+backing.credentials.set('PIXEL_API_PASSWORD', 'pw-7')
+let verifiesAt = verifyCalls()
+let loginsAt = loginCalls()
+const cancelAt = Date.now()
+backing.config.cancelChallengeAt?.[WRITE]?.(cancelAt)
+backing.emit('loader/volatile-update')
+await until(() => backing.status()?.state !== '2fa')
+check('返回: status none, with no message and no user', statusIs(backing.status(), 'none', '', ''), backing.status())
+check('  ...the code and the password credentials are deleted',
+  !backing.credentials.has('PIXEL_API_2FA') && !backing.credentials.has('PIXEL_API_PASSWORD'), [...backing.credentials.keys()])
+check('  ...neither the code nor the password went to the site',
+  verifyCalls() === verifiesAt && loginCalls() === loginsAt, { verify: verifyCalls() - verifiesAt, login: loginCalls() - loginsAt })
+check('  ...the served value is stamped into the status', backing.status()?.cancelChallengeAt === cancelAt, backing.status())
+check('  ...the username stays for the login form', read(backing.config.username) === 'tester', read(backing.config.username))
+// In the host that status write re-runs reconcile: the 2FA step must not return.
+let writesAt = backing.statuses.length
+backing.emit('loader/volatile-update')
+await until(() => backing.statuses.length > writesAt)
+check('  ...the next pass leaves the 2FA step gone', backing.status()?.state === 'none', backing.status())
+// A new sign-in from the login form: its password reaches the site.
+loginsAt = loginCalls()
+backing.credentials.set('PIXEL_API_PASSWORD', 'pw-8')
+backing.emit('credentials/reference-updated', 'PIXEL_API_PASSWORD')
+await until(() => loginCalls() > loginsAt && backing.status()?.state === '2fa')
+check('a new password after 返回 goes to the site as a new sign-in, not to the old challenge',
+  loginCalls() === loginsAt + 1 && backing.status()?.state === '2fa', { login: loginCalls() - loginsAt, status: backing.status() })
+// That sign-in stopped at the 2FA step again. The served value once more, then
+// an older one: neither cancels the new challenge.
+writesAt = backing.statuses.length
+backing.config.cancelChallengeAt?.[WRITE]?.(cancelAt)
+backing.emit('loader/volatile-update')
+await settle()
+backing.config.cancelChallengeAt?.[WRITE]?.(cancelAt - 1000)
+backing.emit('loader/volatile-update')
+await settle()
+check('  ...the served value again, then an older one: the new challenge stays',
+  backing.status()?.state === '2fa' && loginCalls() === loginsAt + 1 && backing.statuses.length === writesAt,
+  { status: backing.status(), writes: backing.statuses.length - writesAt })
+verifiesAt = verifyCalls()
+backing.credentials.set('PIXEL_API_2FA', '222222')
+backing.emit('credentials/reference-updated', 'PIXEL_API_2FA')
+await until(() => backing.status()?.state === 'ok')
+check('  ...and its code completes the sign-in',
+  statusIs(backing.status(), 'ok', '', 'tester') && verifyCalls() === verifiesAt + 1,
+  { status: backing.status(), verify: verifyCalls() - verifiesAt })
+// Signed in, no challenge pending: 返回 is only recorded.
+writesAt = backing.statuses.length
+const keysAt = [...backing.credentials.keys()]
+const idleCancelAt = Date.now() + 1
+backing.config.cancelChallengeAt?.[WRITE]?.(idleCancelAt)
+backing.emit('loader/volatile-update')
+await until(() => backing.statuses.length > writesAt)
+check('返回 with no challenge pending: still signed in, credentials and routes as they were',
+  backing.status()?.state === 'ok' && isDeepStrictEqual([...backing.credentials.keys()], keysAt) && backing.registered.length === 1,
+  { status: backing.status(), credentials: [...backing.credentials.keys()], registered: backing.registered.length })
+check('  ...only the served value is recorded, riding the next status write',
+  backing.status()?.cancelChallengeAt === idleCancelAt, backing.status())
+// A reload starts from the stored config, the served value in its status: the
+// next fiber leaves its own new challenge alone, and a newer value still works.
+const reloaded = await bootInstance(undefined, {
+  password: 'pw-9',
+  config: { cancelChallengeAt: idleCancelAt, auth: { state: 'ok', user: 'tester', cancelChallengeAt: idleCancelAt } },
+})
+await until(() => reloaded.status()?.state === '2fa')
+check('after a reload, the served value does not cancel the new challenge', reloaded.status()?.state === '2fa', reloaded.status())
+reloaded.config.cancelChallengeAt?.[WRITE]?.(Date.now() + 2)
+reloaded.emit('loader/volatile-update')
+await until(() => reloaded.status()?.state !== '2fa')
+check('  ...a newer value still cancels it', statusIs(reloaded.status(), 'none', '', ''), reloaded.status())
+loginMode = 'ok'
+
+// ---------------------------------------------------------------------------
+// The site rotates the refresh cookie with every session it issues and
+// revokes the session when the replaced one comes back more than 30 s later
+// (new-api-main model/user_session.go RotateUserSessionRefresh), so the new
+// cookie must be stored before the session is taken on. Here the credential
+// store refuses that write, naming another temp file each time.
+log('Rotated refresh cookie the credential store cannot keep')
+const STORE_FAILED = 'PIXEL 登录会话保存失败：本机凭据写入出错，登录无法保持'
+refreshMode = 'rotate'
+const unkept = await bootInstance('seed-refresh-g', { failingWrites: ['PIXEL_API_REFRESH'] })
+await until(() => unkept.status() !== undefined)
+check('a refresh whose new cookie is not stored: status error with the fixed text (not ok, not 会话已过期)',
+  statusIs(unkept.status(), 'error', STORE_FAILED), unkept.status())
+check('  ...the session is not taken on: no routes registered', unkept.registered.length === 0, unkept.registered)
+check('  ...the stored cookie is left as it was', unkept.credentials.get('PIXEL_API_REFRESH') === 'seed-refresh-g',
+  unkept.credentials.get('PIXEL_API_REFRESH'))
+check("  ...the store's own reason is in the log", unkept.warnings.some((line) => line.includes('EPERM')), unkept.warnings)
+// In the host that status write re-runs reconcile. The same failure again,
+// under another temp file name, must leave the status alone: a changing text
+// would start the next pass, and the next, until the old cookie expired.
+let refreshesAt = refreshCalls()
+writesAt = unkept.statuses.length
+unkept.emit('loader/volatile-update')
+await until(() => refreshCalls() > refreshesAt)
+await settle()
+check('  ...failing again under another reason rewrites nothing (no write → reconcile loop)',
+  refreshCalls() === refreshesAt + 1 && unkept.statuses.length === writesAt,
+  { refreshes: refreshCalls() - refreshesAt, writes: unkept.statuses.length - writesAt })
+unkept.failingWrites.clear()
+unkept.emit('loader/volatile-update')
+await until(() => unkept.status()?.state === 'ok')
+check('  ...the store writable again: the next pass keeps the session, its new cookie stored',
+  statusIs(unkept.status(), 'ok', '', 'tester') && /^rotated-\d+$/.test(unkept.credentials.get('PIXEL_API_REFRESH') ?? ''),
+  { status: unkept.status(), cookie: unkept.credentials.get('PIXEL_API_REFRESH') })
+// A chat request the site turned down refreshes the session itself: the same
+// failure fails that request under its own code and the fixed text — not
+// AUTH, whose text the chat blanks — and nothing is sent again.
+const chatting = await bootInstance('seed-refresh-h')
+await until(() => chatting.status()?.state === 'ok' && chatting.registered.length > 0)
+chatting.failingWrites.add('PIXEL_API_REFRESH')
+const sentAt = chatBodies.length
+let chatAttempts = 0
+const unkeptChat = finishOf(await streamOn(chatting, () => (chatAttempts++ === 0 ? turnedDown() : answered())))?.failure
+check('chat 401, then a refresh whose new cookie is not stored: NO_CREDENTIAL_STORE with the fixed text',
+  failureMatches(unkeptChat, { code: 'NO_CREDENTIAL_STORE', message: STORE_FAILED }), unkeptChat)
+check('  ...the request is not sent again', chatBodies.length - sentAt === 1, chatBodies.length - sentAt)
+refreshMode = 'ok'
+// A sign-in whose cookie is not stored fails the same way, and is no failed
+// login: the same password right after is sent, not held back by the backoff.
+loginMode = 'rotate'
+const unkeptLogin = await bootInstance(undefined, { password: 'pw-10', failingWrites: ['PIXEL_API_REFRESH'] })
+await until(() => unkeptLogin.status() !== undefined)
+check('a sign-in whose new cookie is not stored: status error with the fixed text',
+  statusIs(unkeptLogin.status(), 'error', STORE_FAILED, 'tester'), unkeptLogin.status())
+check('  ...that session is not taken on either: no routes registered', unkeptLogin.registered.length === 0, unkeptLogin.registered)
+unkeptLogin.failingWrites.clear()
+loginsAt = loginCalls()
+unkeptLogin.credentials.set('PIXEL_API_PASSWORD', 'pw-10')
+unkeptLogin.emit('loader/volatile-update')
+await until(() => unkeptLogin.status()?.state === 'ok')
+check('  ...the same password right after goes to the site (no login backoff): signed in',
+  statusIs(unkeptLogin.status(), 'ok', '', 'tester') && loginCalls() === loginsAt + 1,
+  { status: unkeptLogin.status(), login: loginCalls() - loginsAt })
+// The same through a 2FA code.
+loginMode = '2fa'
+verifyMode = 'rotate'
+const unkeptCode = await bootInstance(undefined, { password: 'pw-11', failingWrites: ['PIXEL_API_REFRESH'] })
+await until(() => unkeptCode.status()?.state === '2fa')
+unkeptCode.credentials.set('PIXEL_API_2FA', '333333')
+unkeptCode.emit('credentials/reference-updated', 'PIXEL_API_2FA')
+await until(() => unkeptCode.status()?.state !== '2fa')
+check('a 2FA code accepted, its new cookie not stored: status error with the fixed text',
+  statusIs(unkeptCode.status(), 'error', STORE_FAILED, 'tester'), unkeptCode.status())
+check("  ...the code's session is not taken on: no routes registered", unkeptCode.registered.length === 0, unkeptCode.registered)
+loginMode = 'ok'
+verifyMode = 'ok'
+
+// ---------------------------------------------------------------------------
+// The runtime keeps each route's display name from registration (dsh-llm
+// prepareRoutes reads providerInfo), and only a replace reads it again. A
+// group whose ratio or room name the site changed under the same key must
+// still reach it; an unchanged reload must not replace anything.
+log('Route names follow the site (ratio, room name)')
+const providerNames = (instance) =>
+  Object.fromEntries(instance.llm.listProviders().map((provider) => [provider.id, provider.name]))
+// A signed-in instance, then one settings-page refresh (a full reload of the
+// groups) with the site answering `groups`.
+const reloadWith = async (groups) => {
+  siteGroups = DEFAULT_GROUPS
+  const instance = await bootInstance('seed-refresh-i')
+  await until(() => instance.status()?.state === 'ok' && instance.registered.length > 0)
+  let announced = 0
+  instance.app.on('llm/adapters-updated', () => { announced += 1 })
+  siteGroups = groups
+  const fetchesAt = groupFetches()
+  const writesBefore = instance.statuses.length
+  instance.config.refreshAt[WRITE](Date.now())
+  instance.emit('loader/volatile-update')
+  await until(() => groupFetches() > fetchesAt && instance.statuses.length > writesBefore)
+  siteGroups = DEFAULT_GROUPS
+  return {
+    names: providerNames(instance),
+    ids: instance.llm.listProviders().map((provider) => provider.id),
+    announced,
+    fetched: groupFetches() - fetchesAt,
+  }
+}
+let renamed = await reloadWith(DEFAULT_GROUPS)
+check('unchanged groups: names carry the ratio, and a reload replaces nothing',
+  isDeepStrictEqual(renamed.names, { 'pixel/room-1024': 'Room 1024 ×0.5', 'pixel/default': 'default ×1' })
+  && renamed.fetched === 1 && renamed.announced === 0, renamed)
+renamed = await reloadWith({ ...DEFAULT_GROUPS, default: { ratio: 1.5 } })
+check("a group's ratio changed under the same key: the runtime has the new name, announced once",
+  isDeepStrictEqual(renamed.names, { 'pixel/room-1024': 'Room 1024 ×0.5', 'pixel/default': 'default ×1.5' })
+  && renamed.announced === 1, renamed)
+renamed = await reloadWith({ ...DEFAULT_GROUPS, 'room-1024': { ...DEFAULT_GROUPS['room-1024'], room_name: 'Room 2048' } })
+check('a room renamed under the same key: the runtime has the new name, announced once',
+  isDeepStrictEqual(renamed.names, { 'pixel/room-1024': 'Room 2048 ×0.5', 'pixel/default': 'default ×1' })
+  && renamed.announced === 1, renamed)
+check('  ...the same routes, in the same order', isDeepStrictEqual(renamed.ids, ['pixel/room-1024', 'pixel/default']), renamed.ids)
+
+// ---------------------------------------------------------------------------
+// A profile that mounts no attachment service: every request builds its image
+// reader, so only reading an image may fail, never a text-only request.
+log('No attachment service mounted')
+const bare = await bootInstance('seed-refresh-m', { attachments: false })
+await until(() => bare.status()?.state === 'ok' && bare.registered.length > 0)
+let bareChunks = await streamOn(bare, answered)
+check('a text-only request goes through', finishOf(bareChunks)?.kind === 'stop', finishOf(bareChunks))
+const sentBeforeImage = chatBodies.length
+bareChunks = await streamOn(bare, answered, [{ role: 'user', content: [textBlock('look'), imageBlock('img-1')] }])
+check('  ...a request with an image still fails UNSUPPORTED_CONTENT, before anything is sent',
+  failureMatches(finishOf(bareChunks)?.failure, {
+    code: 'UNSUPPORTED_CONTENT',
+    message: 'pixel-api: image input needs the attachment service, which this profile does not mount',
+  }) && chatBodies.length === sentBeforeImage,
+  { failure: finishOf(bareChunks)?.failure, sent: chatBodies.length - sentBeforeImage })
+
+// ---------------------------------------------------------------------------
+// A chat request turned down (401) while a reconcile is between site calls.
+// The token it drops goes on the session chain, so the reconcile's later calls
+// still carry the token it checked, never an empty Bearer. Only that token is
+// dropped: a second request turned down with it keeps the token the first
+// one's refresh brought, instead of refreshing again.
+log('A chat 401 while a reconcile is in flight')
+const racing = await bootInstance('seed-refresh-n')
+await until(() => racing.status()?.state === 'ok' && racing.registered.length > 0)
+let releaseChat
+const chatHeld = new Promise((resolve) => { releaseChat = resolve })
+let raceAttempts = 0
+let raceToken
+const raceStream = streamOn(racing, async (body, init) => {
+  raceAttempts += 1
+  if (raceAttempts > 1) return answered()
+  raceToken = new Headers(init.headers).get('authorization')
+  await chatHeld
+  return turnedDown()
+})
+await until(() => raceAttempts === 1)
+// A settings-page refresh starts a full reload, held at the group list.
+let releaseGroups
+groupsGate = new Promise((resolve) => { releaseGroups = resolve })
+const callsAtReload = apiCalls.length
+const fetchesAtRace = groupFetches()
+racing.config.refreshAt[WRITE](Date.now())
+racing.emit('loader/volatile-update')
+await until(() => groupFetches() > fetchesAtRace)
+// The site turns the chat request down meanwhile; then the group list arrives.
+releaseChat()
+await settle()
+groupsGate = undefined
+releaseGroups()
+const raceChunks = await raceStream
+const reloadCalls = apiCalls.slice(callsAtReload)
+  .filter((call) => call.path === '/api/pricing' || call.path === '/api/user/self')
+check('reconcile calls after the chat 401 still carry the token it checked, not an empty one',
+  reloadCalls.length === 2 && raceToken !== undefined && reloadCalls.every((call) => call.authorization === raceToken),
+  { raceToken, reloadCalls })
+check('  ...the chat request then refreshes and goes through', finishOf(raceChunks)?.kind === 'stop' && raceAttempts === 2,
+  { finish: finishOf(raceChunks), attempts: raceAttempts })
+const pair = await bootInstance('seed-refresh-o')
+await until(() => pair.status()?.state === 'ok' && pair.registered.length > 0)
+// Each request's first attempt waits for its release, then is turned down.
+const holds = new Map()
+const turnedDownOnce = new Set()
+const pairResponder = async (body) => {
+  const text = body.messages.at(-1).content
+  if (turnedDownOnce.has(text)) return answered()
+  turnedDownOnce.add(text)
+  await new Promise((resolve) => holds.set(text, resolve))
+  return turnedDown()
+}
+const refreshesAtPair = refreshCalls()
+const streamA = streamOn(pair, pairResponder, [userSays('A')])
+const streamB = streamOn(pair, pairResponder, [userSays('B')])
+await until(() => holds.size === 2)
+holds.get('A')?.()
+const chunksA = await streamA
+holds.get('B')?.()
+const chunksB = await streamB
+check('two requests turned down with the same token: one refresh, and both go through',
+  refreshCalls() - refreshesAtPair === 1 && finishOf(chunksA)?.kind === 'stop' && finishOf(chunksB)?.kind === 'stop',
+  { refreshes: refreshCalls() - refreshesAtPair, a: finishOf(chunksA), b: finishOf(chunksB) })
 
 check('every site request refused redirects', redirectViolations === 0, redirectViolations)
 const unsignalled = apiCalls.filter((call) => !call.signalled)

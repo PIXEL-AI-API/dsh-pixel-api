@@ -322,6 +322,9 @@ export const Config = z.object({
   refreshAt: z.number().default(0).volatile(),
   // Settings page "退出登录" bumps this; the host revokes the site session.
   signOutAt: z.number().default(0).volatile(),
+  // Settings page "返回" on the 2FA step bumps this; the host drops the pending
+  // challenge and the sign-in credentials that came with it.
+  cancelChallengeAt: z.number().default(0).volatile(),
   // Writes ~/.dsh/pixel-api/debug.log (no secrets) for troubleshooting.
   debug: z.boolean().default(false).volatile(),
   auth: z.object({
@@ -335,8 +338,11 @@ export const Config = z.object({
     // Highest signOutAt request already served; kept so an ordinary reload
     // never replays a sign-out whose revoke already happened.
     signOutAt: z.number().default(0),
+    // Highest cancelChallengeAt request already served, kept the same way so a
+    // reload never replays a cancel against a newer challenge.
+    cancelChallengeAt: z.number().default(0),
     profile: Profile,
-  }).default({ state: 'none', message: '', user: '', groups: [], groupCount: 0, models: -1, signOutAt: 0, profile: { ...EMPTY_PROFILE } }).volatile(),
+  }).default({ state: 'none', message: '', user: '', groups: [], groupCount: 0, models: -1, signOutAt: 0, cancelChallengeAt: 0, profile: { ...EMPTY_PROFILE } }).volatile(),
   // Settings page "检查更新" / "更新" bump these; the host serves each newer
   // value once and records the served value in `update`.
   updateCheckAt: z.number().default(0).volatile(),
@@ -379,6 +385,19 @@ const isRetryableSiteError = (error) => error instanceof SiteError && error.retr
 // describeFailure turns a TimeoutError into 连接超时.
 const siteUnreachable = (reason, cause) =>
   new SiteError(`连不上 PIXEL 主站：${describeFailure(reason)}`, 0, { cause })
+// The refresh cookie a sign-in or refresh issued could not be stored. The site
+// rotates that cookie each time and revokes the session when the replaced one
+// comes back more than 30 s later, so such a session cannot be kept. This is
+// the local credential store failing — never the site refusing, never a wrong
+// password. The text is fixed: the store's reason (it names a random temp
+// file) goes to the log, since every status write re-runs reconcile. An
+// LlmError, so a chat request it fails shows this text under its own code.
+class CredentialWriteError extends LlmError {
+  constructor(cause) {
+    super('PIXEL 登录会话保存失败：本机凭据写入出错，登录无法保持', 'NO_CREDENTIAL_STORE', { cause })
+    this.name = 'CredentialWriteError'
+  }
+}
 const NS = 'pixel-api'
 const ROUTE_PREFIX = 'pixel/'
 const REFRESH_COOKIE = 'new_api_refresh'
@@ -395,13 +414,34 @@ function formatRatio(ratio) {
   return String(Number(n.toFixed(4)))
 }
 
+// What the runtime keeps of each route: its id and display name, read through
+// providerInfo only when routes are registered or replaced. A changed name (a
+// group's ratio or room name) thus needs a replace as much as a changed route
+// list. JSON quotes every string, so two different lists never compare equal.
+function routeSignature(routes) {
+  return JSON.stringify([...routes].map(([id, route]) => [id, route.name]))
+}
+
 const isContextWindow = (value) => Number.isSafeInteger(value) && value > 0
 
-// Capacity declared for one model id: an exact override, else the longest
+// The smallest capacity ever declared, the settings page's own minimum
+// (client.js MIN_CONTEXT_WINDOW): compaction-basic keeps 65536 tokens of
+// headroom, so a window at or under that never compacts and cannot be switched
+// to. The Config schema still accepts smaller numbers — refusing them there
+// would stop a profile that already holds one from loading — so the floor
+// applies where the window is declared.
+const MIN_CONTEXT_WINDOW = 65_537
+
+// Capacity declared for one model id: the configured one, raised to the floor.
+function contextWindowFor(model, defaultWindow, overrides) {
+  return Math.max(configuredContextWindow(model, defaultWindow, overrides), MIN_CONTEXT_WINDOW)
+}
+
+// Configured capacity for one model id: an exact override, else the longest
 // matching `prefix*` override, else the configured default. Unusable entries
 // are skipped rather than reported — resolveModel runs before every request,
 // and an invalid capacity would fail each one with INVALID_MODEL_CONTEXT.
-function contextWindowFor(model, defaultWindow, overrides) {
+function configuredContextWindow(model, defaultWindow, overrides) {
   const id = String(model).toLowerCase()
   let prefixWindow
   let prefixLength = 0
@@ -946,12 +986,19 @@ function mapUsage(usage) {
   read = Math.min(read, prompt)
   write = Math.min(write, prompt - read)
   const total = count(usage.total_tokens)
+  // completion_tokens already counts the reasoning (the site adds Gemini's
+  // thoughts in; OpenAI's output includes it), and the Harness reads
+  // reasoningTokens as that part of outputTokens, dropping a usage whose
+  // reasoning exceeds its output. The site sends 0 when the upstream does not
+  // break reasoning out (Claude), so only a positive count that fits is kept.
+  const reasoning = count(usage.completion_tokens_details?.reasoning_tokens)
   return {
     inputTokens: prompt - read - write,
     outputTokens: output,
     ...(total === prompt + output ? { totalTokens: total } : {}),
     cacheReadTokens: read,
     cacheWriteTokens: write,
+    ...(reasoning > 0 && reasoning <= output ? { reasoningTokens: reasoning } : {}),
   }
 }
 
@@ -1290,7 +1337,7 @@ class PixelAdapter extends LlmAdapter {
         throw new LlmError(`pixel-api: request to ${SITE} failed`, 'TRANSPORT', { cause: error })
       }
       if (response.status === 401 && attempt === 0) {
-        this.deps.invalidateAccess()
+        await this.deps.invalidateAccess(token)
         continue
       }
       break
@@ -1369,7 +1416,11 @@ export function apply(ctx, config) {
     handledRefreshAt: 0,
     // Last settings-page sign-out request (config signOutAt) already served;
     // mirrored into the status so a reload does not replay the revoke.
-    statusSignOutAt: 0,    // When the group list + pricing catalog were last refetched from the site.
+    statusSignOutAt: 0,
+    // Last settings-page 2FA cancel (config cancelChallengeAt) already served;
+    // mirrored into the status the same way.
+    statusCancelChallengeAt: 0,
+    // When the group list + pricing catalog were last refetched from the site.
     lastFullRefreshAt: 0,
     groupModels: new Map(),
     // group key -> timestamp before which a failed lookup is not retried
@@ -1386,7 +1437,14 @@ export function apply(ctx, config) {
     const value = hit?.value?.trim()
     return value || undefined
   }
-  const setCred = async (ref, value) => creds()?.set(ref, value)
+  // A write refuses without a credentials service: a session whose cookie went
+  // nowhere would look signed in until its next refresh. Reads and deletes
+  // without one find nothing to read or remove.
+  const setCred = async (ref, value) => {
+    const store = creds()
+    if (!store) throw new Error('this profile mounts no credentials service')
+    await store.set(ref, value)
+  }
   const unsetCred = async (ref) => creds()?.unset(ref)
 
   // Volatile config cells commit in place; unwrap the shared reference to read.
@@ -1397,6 +1455,7 @@ export function apply(ctx, config) {
       username: cell(cfg.username) ?? '',
       refreshAt: Number(cell(cfg.refreshAt) ?? 0) || 0,
       signOutAt: Number(cell(cfg.signOutAt) ?? 0) || 0,
+      cancelChallengeAt: Number(cell(cfg.cancelChallengeAt) ?? 0) || 0,
       auth: cell(cfg.auth) ?? {},
     }
   }
@@ -1429,6 +1488,7 @@ export function apply(ctx, config) {
     groupCount: Number(a?.groupCount ?? 0) || 0,
     models: typeof a?.models === 'number' ? a.models : -1,
     signOutAt: Number(a?.signOutAt ?? 0) || 0,
+    cancelChallengeAt: Number(a?.cancelChallengeAt ?? 0) || 0,
     profile: normProfile(a?.profile),
   })
 
@@ -1452,7 +1512,11 @@ export function apply(ctx, config) {
   // Identical status is never rewritten: each write fires volatile-update →
   // reconcile, so an unconditional write would loop.
   const writeAuth = (patch) => {
-    const next = normAuth({ ...patch, signOutAt: Math.max(Number(patch?.signOutAt ?? 0) || 0, state.statusSignOutAt) })
+    const next = normAuth({
+      ...patch,
+      signOutAt: Math.max(Number(patch?.signOutAt ?? 0) || 0, state.statusSignOutAt),
+      cancelChallengeAt: state.statusCancelChallengeAt,
+    })
     if (JSON.stringify(next) === JSON.stringify(normAuth(sectionOf().auth))) {
       trace('writeAuth skip (unchanged)', next.state)
       return
@@ -1637,11 +1701,14 @@ export function apply(ctx, config) {
   }
 
   let registration
+  // Registers the routes, or replaces them, whenever their ids or display
+  // names change: a replace re-reads every route's providerInfo and announces
+  // the change (llm/adapters-updated), which is how a new ratio or room name
+  // reaches the model pickers. state.routes is set first: providerInfo reads it.
   const applyRoutes = (routes) => {
-    const prev = [...state.routes.keys()].join('')
-    const next = [...routes.keys()].join('')
+    const changed = routeSignature(routes) !== routeSignature(state.routes)
     state.routes = routes
-    if (prev === next) return
+    if (!changed) return
     const ids = [...routes.keys()]
     if (registration === undefined) {
       if (ids.length === 0) return
@@ -1661,18 +1728,29 @@ export function apply(ctx, config) {
     return undefined
   }
 
-  const adoptBundle = (data, res) => {
+  // Takes on a session the site issued. The refresh cookie it carries is stored
+  // first, and only a stored one makes the session this plugin's: the site
+  // rotated the old cookie and honours it for 30 s only, so a session whose new
+  // cookie was lost would work until its next refresh and then be revoked. A
+  // failed write leaves the session untaken and fails the caller; a refresh
+  // with the old cookie inside those 30 s gets the same new cookie again.
+  const adoptBundle = async (data, res) => {
+    const refresh = readRefreshCookie(res)
+    if (refresh) {
+      try {
+        await setCred(REFS.refresh, refresh)
+      } catch (error) {
+        trace('refresh credential write FAILED', String(error?.message ?? error).slice(0, 200))
+        ctx.logger.warn('pixel-api: refresh credential write failed:', error)
+        throw new CredentialWriteError(error)
+      }
+    }
     state.accessToken = data.access_token
     const exp = Number(data.access_expires_at ?? 0)
     state.accessExpiresAt = exp > 1e13 ? exp : exp * 1000
     state.sid = data.session?.sid ?? ''
     state.user = data.user?.username ?? ''
     state.challenge = null
-    const refresh = readRefreshCookie(res)
-    if (refresh) {
-      setCred(REFS.refresh, refresh).catch((err) =>
-        ctx.logger.warn('pixel-api: refresh credential write failed:', err))
-    }
   }
 
   const apiJson = async (path, init) => {
@@ -1734,7 +1812,9 @@ export function apply(ctx, config) {
       loginGuard.failures = 0
       loginGuard.until = 0
     } catch (error) {
-      if (!(error instanceof SiteError && error.status === 0)) {
+      // A session the local store could not keep says nothing about the
+      // password either: the site accepted it.
+      if (!(error instanceof SiteError && error.status === 0) && !(error instanceof CredentialWriteError)) {
         loginGuard.failures++
         const delay = Math.min(LOGIN_BACKOFF_BASE_MS * 2 ** (loginGuard.failures - 1), LOGIN_BACKOFF_MAX_MS)
         loginGuard.until = Date.now() + delay
@@ -1763,7 +1843,7 @@ export function apply(ctx, config) {
       writeAuth({ state: '2fa', message: '该账号启用了两步验证，请输入 TOTP 验证码', user: username, groups: [] })
       return
     }
-    adoptBundle(data, res)
+    await adoptBundle(data, res)
   }
 
   const completeChallenge = async (code) => {
@@ -1775,7 +1855,7 @@ export function apply(ctx, config) {
     if (!body?.success) {
       throw new Error(body?.message ?? `verification failed (HTTP ${res.status})`)
     }
-    adoptBundle(body.data ?? {}, res)
+    await adoptBundle(body.data ?? {}, res)
   }
 
   const refreshSession = async (refreshToken) => {
@@ -1791,7 +1871,7 @@ export function apply(ctx, config) {
     if (!body?.success) {
       throw new SiteError(body?.message ?? `session refresh failed (HTTP ${res.status})`, res.status)
     }
-    adoptBundle(body.data ?? {}, res)
+    await adoptBundle(body.data ?? {}, res)
   }
 
   const serverLogout = async () => {
@@ -2027,7 +2107,12 @@ export function apply(ctx, config) {
     state.statusSignOutAt = Math.max(state.statusSignOutAt, Number(auth.signOutAt ?? 0) || 0)
     const signOut = section.signOutAt > state.statusSignOutAt
     if (signOut) state.statusSignOutAt = section.signOutAt
-    trace('reconcile', { user: !!username, force, signOut, accessFresh: accessFresh(), challenge: !!state.challenge })
+    // A newer cancelChallengeAt is the 2FA step's "返回", served once and
+    // stamped into the status like a sign-out.
+    state.statusCancelChallengeAt = Math.max(state.statusCancelChallengeAt, Number(auth.cancelChallengeAt ?? 0) || 0)
+    const cancelChallenge = section.cancelChallengeAt > state.statusCancelChallengeAt
+    if (cancelChallenge) state.statusCancelChallengeAt = section.cancelChallengeAt
+    trace('reconcile', { user: !!username, force, signOut, cancelChallenge, accessFresh: accessFresh(), challenge: !!state.challenge })
 
     const otp = await resolveCred(REFS.otp)
     const refreshToken = await resolveCred(REFS.refresh)
@@ -2045,6 +2130,20 @@ export function apply(ctx, config) {
     if (signOut) {
       await teardown('', { revoke: true })
       for (const ref of OWN_REFS) await unsetCred(ref)
+      return
+    }
+
+    // "返回" on the 2FA step: drop the pending challenge, with the code and the
+    // password that came with it, so a new sign-in can start; the username
+    // stays for the login form. Ahead of the challenge branch, which would put
+    // the 2FA step straight back and take the next password as its own. With no
+    // challenge pending there is nothing to drop: the request is only recorded
+    // above, and the pass goes on as usual.
+    if (cancelChallenge && state.challenge) {
+      state.challenge = null
+      await unsetCred(REFS.otp)
+      await unsetCred(REFS.password)
+      writeAuth({ state: 'none', message: '', user: '', groups: [] })
       return
     }
 
@@ -2089,9 +2188,10 @@ export function apply(ctx, config) {
         await refreshSession(refreshToken)
       } catch (error) {
         // No answer, a 5xx or a refresh race says nothing about the session:
-        // keep the cookie and leave the retry to the outer handler. Only a
-        // refusal from the site ends the session here.
-        if (isRetryableSiteError(error)) throw error
+        // keep the cookie and leave the retry to the outer handler. Nor does a
+        // new cookie the local store could not keep: the outer handler reports
+        // it. Only a refusal from the site ends the session here.
+        if (isRetryableSiteError(error) || error instanceof CredentialWriteError) throw error
         await unsetCred(REFS.refresh)
         if (username && password) {
           try {
@@ -2153,6 +2253,9 @@ export function apply(ctx, config) {
       try {
         await refreshSession(refreshToken)
       } catch (error) {
+        // A new cookie the local store could not keep is no dead login: it
+        // fails the request under its own code and text.
+        if (error instanceof CredentialWriteError) throw error
         // A passing failure keeps the session: report it in a code the Harness
         // retries. AUTH is never retried, and the chat swaps its text for a
         // generic notice.
@@ -2279,18 +2382,20 @@ export function apply(ctx, config) {
 
   // Request images come from the durable attachment service the same way the
   // shipped pi-ai adapter reads them: one bounded normalized version per
-  // retained image, base64 inlined into the data URL.
+  // retained image, base64 inlined into the data URL. Every request gets a
+  // reader, so the service is looked up only when an image is read: a profile
+  // that does not mount it still sends text-only requests.
   const images = () => {
-    const store = ctx.get('attachments')
-    if (store === undefined || typeof store.readImageRequest !== 'function') {
-      throw new LlmError(
-        'pixel-api: image input needs the attachment service, which this profile does not mount',
-        'UNSUPPORTED_CONTENT',
-      )
-    }
     const cache = new Map()
     return {
       async read(ref) {
+        const store = ctx.get('attachments')
+        if (store === undefined || typeof store.readImageRequest !== 'function') {
+          throw new LlmError(
+            'pixel-api: image input needs the attachment service, which this profile does not mount',
+            'UNSUPPORTED_CONTENT',
+          )
+        }
         const key = ref.attachmentId
         let pending = cache.get(key)
         if (pending === undefined) {
@@ -2322,10 +2427,15 @@ export function apply(ctx, config) {
     fallbackModels,
     images,
     ensureAccess,
-    invalidateAccess: () => {
+    // A chat request's token the site turned down. On the session chain like
+    // every other session change, so a reconcile in flight keeps the token it
+    // checked, and only that token is dropped: one another request has
+    // obtained since stays.
+    invalidateAccess: (token) => enqueue(async () => {
+      if (state.accessToken !== token) return
       state.accessToken = ''
       state.accessExpiresAt = 0
-    },
+    }),
   })
 
   // Suppress the auto-generated form — the settings.section slot renders its own UI.
