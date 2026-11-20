@@ -871,6 +871,43 @@ check('non-claude: system and tool content stay plain strings',
 readImageRequest = noImages
 
 // ---------------------------------------------------------------------------
+// prompt_cache_key: the session id, sent to the site only for gpt- models (it
+// passes it through to the Responses/Codex upstream), clamped to 64 code
+// points like the shipped pi-ai adapter's clampOpenAIPromptCacheKey.
+log('prompt_cache_key (GPT models only)')
+// One request body for `route`, carrying `sessionId` when defined.
+const bodyWith = async (route, sessionId) => {
+  const before = chatBodies.length
+  chat = () => sse([choice({ content: 'ok' }), choice({}, 'stop'), usage, '[DONE]'])
+  for await (const _ of llm.stream({ ...route, messages: [userSays('hi')],
+    ...(sessionId === undefined ? {} : { sessionId }) })) void _
+  return chatBodies.length > before ? chatBodies.at(-1) : undefined
+}
+let keyed = await bodyWith(GPT_ROUTE, 'sess-abc-123')
+check('gpt model with a session id: prompt_cache_key equals it', keyed.prompt_cache_key === 'sess-abc-123', keyed.prompt_cache_key)
+keyed = await bodyWith({ ...GPT_ROUTE, model: 'GPT-6.2-Sol' }, 'sess-cap')
+check('the gpt- match is case-insensitive', keyed.prompt_cache_key === 'sess-cap', keyed.prompt_cache_key)
+keyed = await bodyWith(GPT_ROUTE, 'y'.repeat(64))
+check('a session id of exactly 64 chars is sent whole', keyed.prompt_cache_key === 'y'.repeat(64), keyed.prompt_cache_key?.length)
+keyed = await bodyWith(GPT_ROUTE, 'x'.repeat(100))
+check('a session id over 64 chars is clamped to 64', keyed.prompt_cache_key === 'x'.repeat(64)
+  && keyed.prompt_cache_key.length === 64, keyed.prompt_cache_key?.length)
+// Array.from clamps by code point, not UTF-16 unit: 65 astral chars -> 64.
+keyed = await bodyWith(GPT_ROUTE, '😀'.repeat(65))
+check('clamped by code point, not UTF-16 unit', Array.from(keyed.prompt_cache_key ?? '').length === 64
+  && keyed.prompt_cache_key === '😀'.repeat(64), Array.from(keyed.prompt_cache_key ?? '').length)
+keyed = await bodyWith(GPT_ROUTE, undefined)
+check('gpt model without a session id: no prompt_cache_key', !('prompt_cache_key' in keyed), keyed)
+for (const [label, route] of [
+  ['gemini', GEMINI_ROUTE],
+  ['claude', { provider: 'pixel/default', model: 'claude-opus-5-5' }],
+  ['a model merely starting with "gpt" and no hyphen', { provider: 'pixel/default', model: 'gptx-1' }],
+]) {
+  keyed = await bodyWith(route, 'sess-abc-123')
+  check(`non-gpt (${label}): no prompt_cache_key`, !('prompt_cache_key' in keyed), keyed?.model)
+}
+
+// ---------------------------------------------------------------------------
 // A refresh the site never answered, or answered with a 5xx, says nothing
 // about the session: the request fails in a code the Harness retries and the
 // refresh cookie stays. Only the site's refusal is AUTH.

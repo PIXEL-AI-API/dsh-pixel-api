@@ -804,6 +804,13 @@ async function serializeRequest(options, group, images, openaiReasoningReplay) {
     // each upstream format (Claude output_config, Gemini thinkingConfig) and a
     // model without thinking support answers its own error, surfaced verbatim.
     ...(options.reasoningEffort === undefined ? {} : { reasoning_effort: options.reasoningEffort }),
+    // The session id as the upstream's prompt cache key, GPT models only — the
+    // site passes it through to the Responses/Codex upstream. Clamped to 64
+    // code points, the same bound the shipped pi-ai adapter's
+    // clampOpenAIPromptCacheKey uses. It is an opaque id, no conversation text.
+    ...(/^gpt-/i.test(options.model) && options.sessionId !== undefined
+      ? { prompt_cache_key: Array.from(String(options.sessionId)).slice(0, 64).join('') }
+      : {}),
   }
 }
 
