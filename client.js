@@ -1,8 +1,11 @@
-// PIXEL API — browser half. Registers the 设置 → PIXEL API page: account
-// login (username + password → settings/credentials wire), one-shot TOTP for
-// 2FA challenges, a session status card, the context window settings, and
-// logout. No secret is ever held or rendered here — the host half owns
-// tokens, refresh, and chat traffic.
+// PIXEL API — browser half. Registers the 设置 → PIXEL API page and the
+// two-column model picker. The page reads the host's auth status together
+// with the PIXEL credential references (password set = a sign-in in flight,
+// 2FA code set = a code being checked, refresh set = the session itself) and
+// shows either the login card (username + password, then a one-shot TOTP
+// step) or the account view: identity, balance, context window, GPT replay,
+// plugin version, sign-out. No secret is held here beyond the field being
+// typed into — the host half owns tokens, refresh, and chat traffic.
 
 window.__ModuleLoader__.load({
   id: 'dsh-pixel-api',
@@ -13,7 +16,7 @@ window.__ModuleLoader__.load({
 
     const React = require('react')
     const h = React.createElement
-    const { useCallback, useEffect, useRef, useState } = React
+    const { useCallback, useEffect, useId, useRef, useState } = React
     // react-dom comes from the same browser module table as react; if a
     // build ever omits it, render the panel inline (still position:fixed).
     let createPortal = (node) => node
@@ -27,210 +30,193 @@ window.__ModuleLoader__.load({
     const PLUGIN_ID = 'dsh-pixel-api'
     const NS = 'pixel-api'
     const SITE_URL = 'https://api.ai-pixel.online'
+    const SITE_HOST = SITE_URL.replace(/^https:\/\//, '')
     const STYLE_ID = PLUGIN_ID + '/pixel-api.css'
     const REFS = {
       password: 'PIXEL_API_PASSWORD',
       refresh: 'PIXEL_API_REFRESH',
       otp: 'PIXEL_API_2FA',
     }
+    // A sign-in still running after this long gets a "still waiting" line.
+    const SLOW_SIGN_IN_MS = 12000
+    // Refresh / retry spinners stop on the next auth status or after this.
+    const REFRESH_SPIN_MS = 15000
+    // 「已保存」: 240 ms in, 2 s shown, 240 ms out.
+    const SAVED_NOTICE_MS = 2240
+    const OTP_LENGTH = 6
 
     const zh = {
-      'title': 'PIXEL API',
-      'subtitle': '使用主站账号登录，对话按主站钱包余额计费，无需 API Key。',
+      'login.title': '登录 PIXEL 主站',
+      'login.subtitle': '{site} · 对话按主站钱包余额计费，无需 API Key',
       'field.username': '用户名',
-      'field.username.placeholder': '请输入主站用户名',
       'field.password': '密码',
-      'field.password.placeholder': '请输入主站密码',
-      'field.otp': '两步验证码（TOTP）',
-      'field.otp.placeholder': '请输入 6 位动态验证码',
-      'action.login': '登录',
-      'action.loggingIn': '登录中…',
-      'action.verify': '验证并登录',
-      'action.verifying': '验证中…',
-      'action.logout': '退出登录',
-      'action.refresh': '刷新状态',
+      'field.otp': '两步验证码',
       'action.showPassword': '显示密码',
       'action.hidePassword': '隐藏密码',
-      'action.cancel': '取消',
-      'status.loading': '正在检查会话状态…',
-      'status.pending': '正在登录主站…',
+      'action.login': '登录',
+      'action.loggingIn': '登录中…',
+      'login.slow': '仍在等待主站响应…',
+      'err.username': '请输入用户名',
+      'err.password': '请输入密码',
+      'err.otpFailed': '两步验证未通过：{reason}，请重新登录',
+      'hint.session': '密码只用于这次登录，用完即从本机删除；本机只保留主站签发的登录会话（约 30 天，自动续期）。',
+      'otp.title': '两步验证',
+      'otp.subtitle': '{user} 已启用两步验证，请输入验证器中的 6 位验证码',
+      'action.verify': '验证并登录',
+      'action.verifying': '验证中…',
+      'action.back': '返回',
+      'status.loading': '正在加载',
       'status.ok': '已连接',
-      'status.2fa': '需要两步验证',
-      'status.error': '登录遇到问题',
-      'status.none': '未登录',
-      'card.loginTitle': '主站账号登录',
-      'card.otpTitle': '两步验证挑战（2FA）',
-      'card.statusTitle': '当前连接状态',
-      'ok.balance': '账户余额',
+      'status.interrupted': '连接中断',
+      'load.failed': '读取设置失败：{reason}',
+      'action.retry': '重试',
+      'action.retryNow': '立即重试',
+      'action.openSite': '打开主站',
+      'ok.balance': '余额',
       'ok.used': '已用 {used}',
       'ok.requests': '{count} 次请求',
-      'ok.userGroup': '用户分组 {group}',
-      'ok.mounted': '已接入 {groups} 个分组 · {models} 个模型，可在输入框的模型选择器中使用',
-      'ok.mountedNoModels': '已接入 {groups} 个分组，可在输入框的模型选择器中使用',
-      'ok.updated': '更新于 {time}',
-      'ok.updating': '正在更新…',
-      'ok.unknown': '—',
+      'ok.updated': '{time} 更新',
+      'action.refresh': '刷新',
+      'action.refreshing': '刷新中',
       'action.topup': '充值',
-      'action.openSite': '打开主站',
-      'hint.session': '密码只用于本次登录，登录成功后会立即从本机删除；本机只保留主站签发的登录会话（相当于浏览器里的登录状态）。',
-      'hint.expired': '登录会话（约 30 天）会自动续期；会话失效后需要重新输入一次密码。',
-      'err.required': '请输入主站用户名和密码。',
-      'err.requiredOtp': '请输入两步验证码。',
-      'site': '服务地址',
-      'walletMode': '钱包直接扣费（无 API Key）',
+      'ok.mounted': '已挂载 {groups} 个分组 · {models} 个模型',
+      'ok.mountedNoModels': '已挂载 {groups} 个分组',
+      'action.logout': '退出登录',
+      'logout.confirm': '确定退出？',
+      'action.cancel': '取消',
       'ctx.title': '上下文窗口',
-      'ctx.desc': 'Harness 按这个窗口决定何时自动压缩历史，以及会话中途能否切换到 PIXEL 模型。主站不提供各模型的实际上限，默认按 272K token 计算；与实际不符时在这里调整。',
+      'ctx.summary': '默认 {window} token · {rules} 条单独设置',
+      'ctx.edit': '编辑',
+      'ctx.collapse': '收起',
+      'ctx.desc': 'Harness 按这个窗口决定何时压缩历史、会话中途能否切换到 PIXEL 模型。主站不提供各模型的实际上限，与实际不符时在这里调整。',
       'ctx.default': '默认窗口（token）',
       'ctx.overrides': '按模型单独设置',
       'ctx.overrides.placeholder': '每行一条：模型 ID = token 数，以 * 结尾按前缀匹配\ngemini-* = 1048576\nclaude-opus-5-5 = 1000000',
       'ctx.hint': '精确的模型 ID 优先于前缀，较长的前缀优先于较短的，不区分大小写；数字可写 272k、1m。修改从下一次请求起生效。',
-      'ctx.summary': '当前默认 {window} token · {rules} 条单独设置',
       'ctx.save': '保存',
       'ctx.saving': '保存中…',
       'ctx.reset': '恢复默认',
-      'ctx.saved': '已保存，下一次请求起生效。',
-      'replay.title': 'GPT 加密推理回传',
-      'replay.desc': '开启后，GPT 模型在工具调用的每一步会带回上一步的加密推理，推理更连贯。主站只认产生它的上游账号：同一分组有多个渠道、而主站没有对 /pg/chat/completions 开渠道亲和时，请求换到别的账号会失败，这个会话后面的请求也会跟着失败，关掉本开关即可恢复。确认分组只有一个渠道或主站已配置亲和后再开。',
-      'replay.on': '已开启',
-      'replay.off': '已关闭',
+      'ctx.saved': '已保存',
       'err.ctx.default': '默认窗口必须是大于 65536 的整数（Harness 压缩默认预留 65536 token）。',
       'err.ctx.line': '第 {line} 行格式不对：应为「模型 ID = token 数」，token 数须为大于 65536 的整数。',
       'err.ctx.star': '第 {line} 行：单独的 * 会覆盖所有模型，请直接修改默认窗口。',
-      'upd.title': '插件更新',
-      'upd.version': '当前版本 v{version}',
-      'upd.idle': '点「检查更新」会从 GitHub 读取最新版本，平时不会联网检查。',
-      'upd.checking': '正在检查更新…',
-      'upd.latest': '已是最新版本（v{version}）。',
-      'upd.available': '发现新版本 v{version}。',
-      'upd.availableHint': '更新时插件管理会先移除当前版本再安装新版本，期间 PIXEL 模型和这个页面会暂时消失；安装失败会自动恢复当前版本。',
-      'upd.unsupported': '最新版本是 v{version}，但这份插件不能在这里一键更新：{reason}。',
+      'replay.title': 'GPT 加密推理回传',
+      'replay.summary': '多渠道分组可能失败，默认关闭',
+      'replay.desc': '开启后，GPT 模型在工具调用的每一步会带回上一步的加密推理，推理更连贯。主站只认产生它的上游账号：同一分组有多个渠道、而主站没有对 /pg/chat/completions 开渠道亲和时，请求换到别的账号会失败，这个会话后面的请求也会跟着失败，关掉本开关即可恢复。确认分组只有一个渠道或主站已配置亲和后再开。',
+      'upd.title': '插件版本',
+      'upd.idle': '平时不联网，点「检查更新」从 GitHub 读取最新版本',
+      'upd.checking': '正在检查…',
+      'upd.latest': '已是最新',
+      'upd.checkedAt': '{time} 检查',
+      'upd.available': '可更新到 v{version}',
+      'upd.availableHint': '更新时插件管理会先移除当前版本再安装新版本，期间 PIXEL 模型和本页会暂时消失；安装失败会自动恢复当前版本。',
+      'upd.unsupported': '最新 v{version}，这份插件不能在这里一键更新：{reason}',
       'upd.error': '检查更新失败：{reason}',
-      'upd.updating': '正在更新到 v{version}…完成后这个页面会自动恢复；如果一直没有恢复，请重启 DeepSeek Harness。',
-      'upd.updated': '已更新到 v{version}。',
-      'upd.restart': 'v{version} 已安装，重启 DeepSeek Harness 后生效。',
+      'upd.updating': '正在更新到 v{version}，完成后本页会自动恢复；如果一直没有恢复，请重启 DeepSeek Harness',
+      'upd.updated': '已更新到 v{version}',
+      'upd.restart': 'v{version} 已安装，重启 DeepSeek Harness 后生效',
       'upd.failed': '更新失败：{reason}',
-      'upd.checkedAt': '上次检查 {time}',
       'upd.check': '检查更新',
       'upd.apply': '更新到 v{version}',
+      'upd.applying': '更新中…',
       'upd.confirm': '确认更新',
-      'upd.cancel': '取消',
     }
 
     const en = {
-      'title': 'PIXEL API',
-      'subtitle': 'Sign in with your main-site account; chats bill your site wallet, no API key needed.',
+      'login.title': 'Sign in to PIXEL',
+      'login.subtitle': '{site} · Chats bill your site wallet; no API key needed',
       'field.username': 'Username',
-      'field.username.placeholder': 'Enter your main-site username',
       'field.password': 'Password',
-      'field.password.placeholder': 'Enter your password',
-      'field.otp': 'Two-factor Code (TOTP)',
-      'field.otp.placeholder': 'Enter 6-digit TOTP code',
-      'action.login': 'Sign in',
-      'action.loggingIn': 'Signing in…',
-      'action.verify': 'Verify & Sign in',
-      'action.verifying': 'Verifying…',
-      'action.logout': 'Sign out',
-      'action.refresh': 'Refresh',
+      'field.otp': 'Two-step code',
       'action.showPassword': 'Show password',
       'action.hidePassword': 'Hide password',
-      'action.cancel': 'Cancel',
-      'status.loading': 'Checking session status…',
-      'status.pending': 'Signing in…',
+      'action.login': 'Sign in',
+      'action.loggingIn': 'Signing in…',
+      'login.slow': 'Still waiting for the site…',
+      'err.username': 'Enter your username',
+      'err.password': 'Enter your password',
+      'err.otpFailed': 'Two-step verification failed: {reason}. Sign in again.',
+      'hint.session': 'The password is used for this sign-in only and deleted from this machine right after; only the site-issued session is kept (about 30 days, renewed automatically).',
+      'otp.title': 'Two-step verification',
+      'otp.subtitle': '{user} uses two-step verification. Enter the 6-digit code from your authenticator.',
+      'action.verify': 'Verify and sign in',
+      'action.verifying': 'Verifying…',
+      'action.back': 'Back',
+      'status.loading': 'Loading',
       'status.ok': 'Connected',
-      'status.2fa': 'Two-factor required',
-      'status.error': 'Sign in error',
-      'status.none': 'Not signed in',
-      'card.loginTitle': 'Sign In with Main Site Account',
-      'card.otpTitle': 'Two-Factor Challenge (2FA)',
-      'card.statusTitle': 'Connection Status',
+      'status.interrupted': 'Connection lost',
+      'load.failed': 'Could not read the settings: {reason}',
+      'action.retry': 'Retry',
+      'action.retryNow': 'Retry now',
+      'action.openSite': 'Open site',
       'ok.balance': 'Balance',
       'ok.used': 'Used {used}',
       'ok.requests': '{count} requests',
-      'ok.userGroup': 'Group {group}',
-      'ok.mounted': '{groups} groups · {models} models available in the composer model picker',
-      'ok.mountedNoModels': '{groups} groups available in the composer model picker',
-      'ok.updated': 'Updated {time}',
-      'ok.updating': 'Updating…',
-      'ok.unknown': '—',
+      'ok.updated': 'updated {time}',
+      'action.refresh': 'Refresh',
+      'action.refreshing': 'Refreshing',
       'action.topup': 'Top up',
-      'action.openSite': 'Open site',
-      'hint.session': 'The password is used for this one sign-in and deleted from this machine right after; only the site-issued session (like a browser login) is kept.',
-      'hint.expired': 'The sign-in session (about 30 days) renews automatically; enter your password again once it lapses.',
-      'err.required': 'Username and password are required.',
-      'err.requiredOtp': 'Enter the two-factor code.',
-      'site': 'Server',
-      'walletMode': 'Direct Wallet Billing (No API Key)',
+      'ok.mounted': '{groups} groups · {models} models mounted',
+      'ok.mountedNoModels': '{groups} groups mounted',
+      'action.logout': 'Sign out',
+      'logout.confirm': 'Sign out?',
+      'action.cancel': 'Cancel',
       'ctx.title': 'Context window',
-      'ctx.desc': 'The Harness uses this window to decide when to compact history and whether a session can switch to a PIXEL model mid-conversation. The site does not publish per-model limits, so 272K tokens is assumed; adjust it here when a model differs.',
+      'ctx.summary': 'Default {window} tokens · {rules} per-model rules',
+      'ctx.edit': 'Edit',
+      'ctx.collapse': 'Collapse',
+      'ctx.desc': 'The Harness uses this window to decide when to compact history and whether a session can switch to a PIXEL model mid-conversation. The site does not publish per-model limits; adjust it here when a model differs.',
       'ctx.default': 'Default window (tokens)',
       'ctx.overrides': 'Per-model windows',
       'ctx.overrides.placeholder': 'One per line: model ID = tokens; end with * to match a prefix\ngemini-* = 1048576\nclaude-opus-5-5 = 1000000',
       'ctx.hint': 'An exact model ID beats a prefix and a longer prefix beats a shorter one, ignoring case; numbers may be written as 272k or 1m. Changes apply from the next request.',
-      'ctx.summary': 'Default {window} tokens · {rules} per-model rules',
       'ctx.save': 'Save',
       'ctx.saving': 'Saving…',
       'ctx.reset': 'Restore defaults',
-      'ctx.saved': 'Saved; applies from the next request.',
-      'replay.title': 'GPT encrypted-reasoning passback',
-      'replay.desc': "When on, GPT models carry the previous step's encrypted reasoning into each tool-calling step, for more coherent reasoning. The site accepts it only from the upstream account that produced it: if a group has several channels and the site has no channel affinity for /pg/chat/completions, a request that moves to another account fails and the rest of this session's requests fail with it — turn this switch off to recover. Turn it on only after confirming the group has a single channel, or that the site has affinity configured.",
-      'replay.on': 'On',
-      'replay.off': 'Off',
+      'ctx.saved': 'Saved',
       'err.ctx.default': 'The default window must be an integer above 65536 (Harness compaction reserves 65536 tokens by default).',
       'err.ctx.line': 'Line {line} is malformed: use "model ID = tokens" with an integer above 65536.',
       'err.ctx.star': 'Line {line}: a bare * would cover every model; change the default window instead.',
-      'upd.title': 'Plugin updates',
-      'upd.version': 'Version v{version}',
-      'upd.idle': 'Check for updates reads the newest version from GitHub; nothing is checked in the background.',
-      'upd.checking': 'Checking for updates…',
-      'upd.latest': 'You have the newest version (v{version}).',
-      'upd.available': 'Version v{version} is available.',
+      'replay.title': 'GPT encrypted-reasoning passback',
+      'replay.summary': 'May fail on multi-channel groups; off by default',
+      'replay.desc': "When on, GPT models carry the previous step's encrypted reasoning into each tool-calling step, for more coherent reasoning. The site accepts it only from the upstream account that produced it: if a group has several channels and the site has no channel affinity for /pg/chat/completions, a request that moves to another account fails and the rest of this session's requests fail with it — turn this switch off to recover. Turn it on only after confirming the group has a single channel, or that the site has affinity configured.",
+      'upd.title': 'Plugin version',
+      'upd.idle': 'Nothing is checked in the background; Check for updates reads the newest version from GitHub',
+      'upd.checking': 'Checking…',
+      'upd.latest': 'Up to date',
+      'upd.checkedAt': 'checked {time}',
+      'upd.available': 'v{version} is available',
       'upd.availableHint': 'The plugin manager removes this version, then installs the new one; PIXEL models and this page disappear meanwhile. A failed installation restores this version.',
-      'upd.unsupported': 'The newest version is v{version}, but this copy cannot be updated here: {reason}.',
+      'upd.unsupported': 'Newest is v{version}, but this copy cannot be updated here: {reason}',
       'upd.error': 'Checking for updates failed: {reason}',
-      'upd.updating': 'Updating to v{version}… This page comes back when it finishes; restart DeepSeek Harness if it does not.',
-      'upd.updated': 'Updated to v{version}.',
-      'upd.restart': 'v{version} is installed and takes effect after restarting DeepSeek Harness.',
+      'upd.updating': 'Updating to v{version}; this page comes back when it finishes. Restart DeepSeek Harness if it does not.',
+      'upd.updated': 'Updated to v{version}',
+      'upd.restart': 'v{version} is installed and takes effect after restarting DeepSeek Harness',
       'upd.failed': 'The update failed: {reason}',
-      'upd.checkedAt': 'Last checked {time}',
       'upd.check': 'Check for updates',
       'upd.apply': 'Update to v{version}',
+      'upd.applying': 'Updating…',
       'upd.confirm': 'Confirm update',
-      'upd.cancel': 'Cancel',
     }
 
-    // Inline SVG Icons
-    const EyeIcon = () => h('svg', { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' },
+    // Inline icons: 24-unit strokes in currentColor, hidden from assistive tech.
+    const svgIcon = (size, ...shapes) => h('svg', {
+      width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2,
+      strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true,
+    }, ...shapes)
+    const EyeIcon = () => svgIcon(16,
       h('path', { d: 'M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z' }),
-      h('circle', { cx: 12, cy: 12, r: 3 })
-    )
-
-    const EyeOffIcon = () => h('svg', { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' },
+      h('circle', { cx: 12, cy: 12, r: 3 }))
+    const EyeOffIcon = () => svgIcon(16,
       h('path', { d: 'M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24' }),
-      h('line', { x1: 1, y1: 1, x2: 23, y2: 23 })
-    )
-
-    const ShieldIcon = () => h('svg', { width: 14, height: 14, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' },
-      h('path', { d: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z' })
-    )
-
-    const GlobeIcon = () => h('svg', { width: 13, height: 13, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' },
-      h('circle', { cx: 12, cy: 12, r: 10 }),
-      h('line', { x1: 2, y1: 12, x2: 22, y2: 12 }),
-      h('path', { d: 'M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z' })
-    )
-
-    const LockIcon = () => h('svg', { width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' },
-      h('rect', { x: 3, y: 11, width: 18, height: 11, rx: 2, ry: 2 }),
-      h('path', { d: 'M7 11V7a5 5 0 0 1 10 0v4' })
-    )
-
-    const KeyIcon = () => h('svg', { width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' },
-      h('path', { d: 'M21 2l-2 2m-1.5 1.5L14 9l-3-3-4 4 3 3-5 5v3h3l5-5 3 3 4-4-3-3 3.5-3.5z' })
-    )
-
-    const CheckIcon = () => h('svg', { width: 14, height: 14, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2.5, strokeLinecap: 'round', strokeLinejoin: 'round' },
-      h('polyline', { points: '20 6 9 17 4 12' })
-    )
+      h('line', { x1: 1, y1: 1, x2: 23, y2: 23 }))
+    const ShieldIcon = () => svgIcon(14, h('path', { d: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z' }))
+    const CheckIcon = () => svgIcon(12, h('polyline', { points: '20 6 9 17 4 12' }))
+    const ArrowUpRightIcon = () => svgIcon(12, h('path', { d: 'M7 17 17 7' }), h('path', { d: 'M8 7h9v9' }))
+    const AlertIcon = (props) => svgIcon(props.size || 14,
+      h('circle', { cx: 12, cy: 12, r: 9 }),
+      h('line', { x1: 12, y1: 8, x2: 12, y2: 12.5 }),
+      h('line', { x1: 12, y1: 16, x2: 12.01, y2: 16 }))
 
     function installStyles() {
       if (document.getElementById(STYLE_ID)) return () => {}
@@ -238,597 +224,513 @@ window.__ModuleLoader__.load({
       style.id = STYLE_ID
       style.textContent = `
         .pxa-section {
+          --pxa-ease: cubic-bezier(0.2, 0, 0, 1);
+          --pxa-fast: 120ms;
+          --pxa-mid: 180ms;
+          --pxa-slow: 240ms;
           display: flex;
           flex-direction: column;
           gap: 16px;
-          max-width: 640px;
-          color: var(--dsw-alias-label-primary, #18191b);
-          font-family: inherit;
-        }
-
-        .pxa-header {
-          display: flex;
-          flex-direction: column;
-          gap: 8px;
-        }
-
-        .pxa-header-top {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-        }
-
-        .pxa-title {
-          font-size: 18px;
-          font-weight: 600;
-          line-height: 26px;
-          color: var(--dsw-alias-label-primary, #18191b);
-          margin: 0;
-        }
-
-        .pxa-site-badge {
-          display: inline-flex;
-          align-items: center;
-          gap: 5px;
-          padding: 2px 8px;
-          border-radius: var(--dsw-radius-sm, 6px);
-          background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.08));
-          border: 0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.2));
-          color: var(--dsw-alias-label-secondary, #585a60);
-          font-size: 12px;
-          line-height: 18px;
-          font-family: var(--dsw-font-mono, monospace);
-        }
-
-        .pxa-desc {
+          padding: 8px 0;
+          color: var(--dsw-alias-label-primary);
           font-size: 13px;
-          line-height: 20px;
-          color: var(--dsw-alias-label-secondary, #585a60);
-          margin: 0;
-        }
-
-        .pxa-card {
-          border: 0.5px solid var(--dsw-alias-settings-card-stroke, var(--dsw-alias-border-l2, rgba(0,0,0,0.1)));
-          background: var(--dsw-alias-settings-card-fill, var(--dsw-alias-bg-layer-1, #ffffff));
-          border-radius: var(--dsw-radius-xl, 14px);
-          padding: 18px 20px;
-          display: flex;
-          flex-direction: column;
-          gap: 16px;
-          box-shadow: 0 1px 3px rgba(0,0,0,0.02);
-        }
-
-        .pxa-card-head {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 10px;
-          padding-bottom: 12px;
-          border-bottom: 0.5px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.15));
-        }
-
-        .pxa-card-title {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          font-size: 14px;
-          font-weight: 600;
-          color: var(--dsw-alias-label-primary, #18191b);
-        }
-
-        .pxa-form {
-          display: flex;
-          flex-direction: column;
-          gap: 14px;
-        }
-
-        .pxa-field {
-          display: flex;
-          flex-direction: column;
-          gap: 6px;
-        }
-
-        .pxa-label {
-          font-size: 13px;
-          font-weight: 500;
-          color: var(--dsw-alias-label-primary, #18191b);
-        }
-
-        .pxa-input-wrap {
-          position: relative;
-          display: flex;
-          align-items: center;
-          width: 100%;
-        }
-
-        .pxa-input {
-          box-sizing: border-box;
-          width: 100%;
-          height: 38px;
-          padding: 0 12px;
-          border-radius: var(--dsw-radius-md, 8px);
-          border: 1px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.25));
-          background: var(--dsw-alias-bg-layer-1, #ffffff);
-          color: var(--dsw-alias-label-primary, #18191b);
-          font-size: 14px;
           line-height: 22px;
-          font-family: inherit;
-          outline: none;
-          transition: border-color .15s ease, box-shadow .15s ease;
         }
-
-        .pxa-input.has-toggle {
-          padding-right: 38px;
+        .pxa-enter {
+          animation: pxa-in var(--pxa-slow) var(--pxa-ease) both;
+          animation-delay: calc(var(--pxa-i, 0) * 40ms);
         }
-
-        .pxa-input:focus {
-          border-color: var(--dsw-alias-state-business-primary, #4d6bfe);
-          box-shadow: 0 0 0 2px color-mix(in srgb, var(--dsw-alias-state-business-primary, #4d6bfe) 18%, transparent);
+        .pxa-card {
+          box-sizing: border-box;
+          padding: 12px 16px;
+          border: 0.5px solid var(--dsw-alias-settings-card-stroke);
+          border-radius: var(--dsw-radius-xl);
+          background: var(--dsw-alias-settings-card-fill);
         }
-
-        .pxa-input::placeholder {
-          color: var(--dsw-alias-label-dimmed, #9ca3af);
-          opacity: 1;
-        }
-
-        .pxa-input:disabled {
-          opacity: 0.6;
-          cursor: not-allowed;
-        }
-
-        .pxa-toggle-btn {
+        .pxa-sr {
           position: absolute;
-          right: 4px;
-          height: 30px;
-          width: 30px;
-          border-radius: var(--dsw-radius-sm, 6px);
-          border: none;
-          background: transparent;
-          color: var(--dsw-alias-label-tertiary, #81858c);
+          width: 1px;
+          height: 1px;
+          margin: -1px;
+          padding: 0;
+          border: 0;
+          overflow: hidden;
+          clip-path: inset(50%);
+          white-space: nowrap;
+        }
+
+        .pxa-identity { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+        .pxa-who { display: flex; align-items: center; gap: 10px; min-width: 0; min-height: 44px; }
+        .pxa-avatar {
+          flex: none;
           display: flex;
           align-items: center;
           justify-content: center;
-          cursor: pointer;
-          padding: 0;
-          transition: color .15s ease, background-color .15s ease;
+          width: 32px;
+          height: 32px;
+          border-radius: 50%;
+          corner-shape: round;
+          background: var(--dsw-alias-bg-skeleton);
+          color: var(--dsw-alias-label-tertiary);
+          font-size: 14px;
+          font-weight: 500;
+          line-height: 1;
         }
-
-        .pxa-toggle-btn:hover {
-          color: var(--dsw-alias-label-primary, #18191b);
-          background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.08));
+        .pxa-who-text { display: flex; flex-direction: column; min-width: 0; }
+        .pxa-name {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          font-size: 14px;
+          font-weight: 500;
+          line-height: 22px;
         }
-
-        .pxa-actions {
+        .pxa-who-sub {
           display: flex;
-          gap: 10px;
+          flex-wrap: wrap;
           align-items: center;
-          padding-top: 4px;
+          column-gap: 4px;
+          font-size: 12px;
+          line-height: 18px;
+          color: var(--dsw-alias-label-tertiary);
+        }
+        .pxa-conn { display: inline-flex; align-items: center; gap: 4px; }
+        .pxa-dot {
+          flex: none;
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
+          corner-shape: round;
+          background: var(--dsw-alias-state-success-primary);
+        }
+        .pxa-dot.warn { background: var(--dsw-alias-state-warn-primary); }
+        .pxa-dot.pulse { animation: pxa-pulse 900ms var(--pxa-ease) var(--pxa-slow) both; }
+        .pxa-site-link {
+          flex: none;
+          display: inline-flex;
+          align-items: center;
+          gap: 2px;
+          border-radius: var(--dsw-radius-xs);
+          color: var(--dsw-alias-label-secondary);
+          font-size: 13px;
+          line-height: 22px;
+          text-decoration: none;
+          transition: color var(--pxa-fast) var(--pxa-ease);
+        }
+        .pxa-site-link:hover { color: var(--dsw-alias-label-primary); }
+
+        .pxa-balance { display: flex; flex-direction: column; gap: 8px; }
+        .pxa-line {
+          box-sizing: border-box;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 16px;
+          min-height: 40px;
+          padding: 6px 0;
+        }
+        .pxa-divider { border-top: 0.5px solid var(--dsw-alias-border-l2); }
+        .pxa-amount {
+          font-size: 16px;
+          font-weight: 600;
+          line-height: 24px;
+          font-variant-numeric: tabular-nums;
+          transition: opacity var(--pxa-mid) var(--pxa-ease);
+        }
+        .pxa-amount.dim { opacity: 0.45; }
+        .pxa-meta {
+          min-width: 0;
+          font-size: 12px;
+          line-height: 18px;
+          color: var(--dsw-alias-label-tertiary);
+          overflow-wrap: anywhere;
+        }
+        .pxa-meta.err { color: var(--dsw-alias-state-error-primary); }
+        .pxa-actions {
+          flex: none;
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 8px;
         }
 
         .pxa-btn {
           box-sizing: border-box;
-          height: 36px;
-          padding: 0 18px;
-          border-radius: var(--dsw-radius-md, 8px);
-          font-size: 13px;
-          font-weight: 500;
-          font-family: inherit;
-          cursor: pointer;
           display: inline-flex;
           align-items: center;
           justify-content: center;
           gap: 6px;
-          transition: all .15s ease;
-          border: 1px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.25));
-          background: var(--dsw-alias-bg-layer-1, #ffffff);
-          color: var(--dsw-alias-label-primary, #18191b);
-        }
-
-        .pxa-btn:hover:not(:disabled) {
-          background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.08));
-        }
-
-        .pxa-btn.primary {
-          border: none;
-          background: var(--dsw-alias-button-primary-fill, #4d6bfe);
-          color: var(--dsw-alias-label-primary-foreground, #ffffff);
-        }
-
-        .pxa-btn.primary:hover:not(:disabled) {
-          background: var(--dsw-alias-button-primary-hover, #3b5bf5);
-        }
-
-        .pxa-btn.danger {
-          color: var(--dsw-alias-state-error-primary, #d54941);
-          border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary, #d54941) 30%, transparent);
-        }
-
-        .pxa-btn.danger:hover:not(:disabled) {
-          background: var(--dsw-alias-interactive-bg-hover-danger, rgba(213,73,65,0.08));
-        }
-
-        .pxa-btn:disabled {
-          opacity: 0.5;
-          cursor: not-allowed;
-        }
-
-        .pxa-banner {
-          padding: 10px 14px;
-          border-radius: var(--dsw-radius-md, 8px);
+          height: 32px;
+          padding: 0 12px;
+          border: 0.5px solid var(--dsw-alias-border-l3);
+          border-radius: var(--dsw-radius-md);
+          background: transparent;
+          color: var(--dsw-alias-label-primary);
+          font: inherit;
           font-size: 13px;
           line-height: 20px;
-          display: flex;
-          align-items: flex-start;
-          gap: 8px;
+          white-space: nowrap;
+          text-decoration: none;
+          cursor: pointer;
+          transition: background-color var(--pxa-fast) var(--pxa-ease), transform var(--pxa-fast) var(--pxa-ease), opacity var(--pxa-fast) var(--pxa-ease);
         }
-
-        .pxa-banner.err {
-          background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #d54941) 10%, transparent);
-          border: 0.5px solid color-mix(in srgb, var(--dsw-alias-state-error-primary, #d54941) 30%, transparent);
-          color: var(--dsw-alias-state-error-primary, #d54941);
+        .pxa-btn:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
+        .pxa-btn:active:not(:disabled) { transform: scale(0.98); }
+        .pxa-btn:disabled { cursor: not-allowed; opacity: 0.4; }
+        .pxa-btn[aria-busy='true']:disabled { cursor: progress; opacity: 0.85; }
+        .pxa-btn.primary {
+          border-color: transparent;
+          background: var(--dsw-alias-button-primary-fill);
+          color: var(--dsw-alias-label-primary-foreground);
+          font-weight: 500;
         }
-
-        .pxa-banner.info {
-          background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4d6bfe) 8%, transparent);
-          border: 0.5px solid color-mix(in srgb, var(--dsw-alias-state-business-primary, #4d6bfe) 25%, transparent);
-          color: var(--dsw-alias-label-primary, #18191b);
-        }
-
-        .pxa-banner.warn {
-          background: color-mix(in srgb, var(--dsw-alias-state-warn-label, #b07000) 10%, transparent);
-          border: 0.5px solid color-mix(in srgb, var(--dsw-alias-state-warn-label, #b07000) 28%, transparent);
-          color: var(--dsw-alias-state-warn-label, #b07000);
-        }
-
-        .pxa-security-hint {
-          display: flex;
-          align-items: flex-start;
-          gap: 8px;
+        .pxa-btn.primary:hover:not(:disabled) { background: var(--dsw-alias-button-primary-hover); }
+        .pxa-btn.danger { color: var(--dsw-alias-state-error-primary); }
+        .pxa-btn.danger:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover-danger); }
+        .pxa-btn.sm {
+          height: 28px;
+          padding: 0 10px;
+          border-radius: var(--dsw-radius-sm);
           font-size: 12px;
           line-height: 18px;
-          color: var(--dsw-alias-label-tertiary, #81858c);
-          margin-top: 4px;
         }
-
-        .pxa-security-hint svg {
-          flex-shrink: 0;
-          margin-top: 2px;
-        }
-
-        .pxa-status-row {
-          display: flex;
-          align-items: center;
-          gap: 12px;
-        }
-
-        .pxa-avatar {
-          width: 42px;
-          height: 42px;
-          border-radius: 50%;
-          background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d6bfe) 15%, transparent);
-          color: var(--dsw-alias-brand-primary, #4d6bfe);
-          font-weight: 600;
-          font-size: 16px;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          flex-shrink: 0;
-        }
-
-        .pxa-user-info {
-          display: flex;
-          flex-direction: column;
-          gap: 3px;
-          min-width: 0;
-          flex: 1;
-        }
-
-        .pxa-user-name {
-          font-size: 15px;
-          font-weight: 600;
-          color: var(--dsw-alias-label-primary, #18191b);
-        }
-
-        .pxa-user-sub {
-          font-size: 12px;
-          color: var(--dsw-alias-label-tertiary, #81858c);
-          display: flex;
-          align-items: center;
-          gap: 6px;
-        }
-
-        .pxa-badge-success {
+        .pxa-btn.block { width: 100%; height: 40px; font-size: 14px; line-height: 22px; }
+        .pxa-text-btn {
           display: inline-flex;
           align-items: center;
-          gap: 5px;
-          padding: 2px 8px;
-          border-radius: 999px;
-          font-size: 11px;
-          font-weight: 500;
-          background: color-mix(in srgb, var(--dsw-alias-state-success-primary, #2ea043) 12%, transparent);
-          color: var(--dsw-alias-state-success-primary, #2ea043);
-        }
-
-        .pxa-status-dot {
-          width: 7px;
-          height: 7px;
-          border-radius: 50%;
-          background: currentColor;
-        }
-
-        .pxa-stats {
-          display: flex;
-          gap: 10px;
-          margin-top: 14px;
-        }
-
-        .pxa-stat {
-          flex: 1;
-          display: flex;
-          flex-direction: column;
-          align-items: center;
-          gap: 2px;
-          padding: 10px 12px;
-          border-radius: var(--dsw-radius-md, 8px);
-          background: var(--dsw-alias-bg-layer-2, rgba(128,128,128,0.06));
-          border: 0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.18));
-        }
-
-        .pxa-stat-value {
-          font-size: 18px;
-          font-weight: 600;
-          line-height: 1.2;
-          color: var(--dsw-alias-label-primary, #18191b);
-          font-variant-numeric: tabular-nums;
-        }
-
-        .pxa-stat-key {
-          font-size: 11px;
-          color: var(--dsw-alias-label-tertiary, #81858c);
-        }
-
-        .pxa-groups-wrap {
-          display: flex;
-          flex-direction: column;
-          gap: 8px;
-          padding-top: 10px;
-        }
-
-        .pxa-groups-label {
-          font-size: 12px;
-          font-weight: 500;
-          color: var(--dsw-alias-label-secondary, #4b4f58);
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-        }
-
-        .pxa-groups-count {
-          font-size: 11px;
-          color: var(--dsw-alias-label-tertiary, #81858c);
-          font-weight: normal;
-        }
-
-        .pxa-chips {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 6px;
-          align-content: flex-start;
-          max-height: 148px;
-          overflow-y: auto;
-          padding: 10px;
-          border-radius: var(--dsw-radius-md, 8px);
-          border: 0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.18));
-          background: var(--dsw-alias-bg-layer-2, rgba(128,128,128,0.04));
-          scrollbar-width: thin;
-        }
-
-        .pxa-chip {
-          padding: 3px 10px;
-          border-radius: 999px;
-          font-size: 11px;
-          font-weight: 500;
-          line-height: 1.5;
-          white-space: nowrap;
-          max-width: 220px;
-          overflow: hidden;
-          text-overflow: ellipsis;
-          background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.08));
-          border: 0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.2));
-          color: var(--dsw-alias-label-primary, #18191b);
-        }
-
-        .pxa-otp-input {
-          letter-spacing: 6px;
-          font-size: 20px;
-          font-weight: 600;
-          text-align: center;
-          height: 44px;
-          font-family: var(--dsw-font-mono, monospace);
-        }
-
-        .pxa-id-card {
-          flex-direction: row;
-          align-items: center;
-          gap: 12px;
-        }
-
-        .pxa-id-side {
-          display: flex;
-          flex-direction: column;
-          align-items: flex-end;
-          gap: 6px;
-          flex-shrink: 0;
-        }
-
-        .pxa-link {
-          font-size: 13px;
-          color: var(--dsw-alias-label-primary, #18191b);
-          text-decoration: none;
-        }
-
-        .pxa-link:hover { text-decoration: underline; }
-
-        .pxa-balance-card { gap: 0; padding: 0 20px; }
-
-        .pxa-balance-row {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 12px;
-          padding: 20px 0;
-          border-bottom: 0.5px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.15));
-        }
-
-        .pxa-balance-label {
-          font-size: 14px;
-          color: var(--dsw-alias-label-primary, #18191b);
-        }
-
-        .pxa-balance-value {
-          font-size: 24px;
-          font-weight: 600;
-          line-height: 32px;
-          font-variant-numeric: tabular-nums;
-          color: var(--dsw-alias-label-primary, #18191b);
-          transition: opacity .15s ease;
-        }
-
-        .pxa-balance-value.dim { opacity: .45; }
-
-        .pxa-balance-foot {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 12px;
-          padding: 14px 0;
-        }
-
-        .pxa-balance-meta {
-          min-width: 0;
+          gap: 4px;
+          padding: 0;
+          border: 0;
+          border-radius: var(--dsw-radius-xs);
+          background: none;
+          color: var(--dsw-alias-label-secondary);
+          font: inherit;
           font-size: 12px;
           line-height: 18px;
-          color: var(--dsw-alias-label-tertiary, #81858c);
+          cursor: pointer;
+          transition: color var(--pxa-fast) var(--pxa-ease);
+        }
+        .pxa-text-btn.md { font-size: 13px; line-height: 20px; }
+        .pxa-text-btn:hover:not(:disabled) { color: var(--dsw-alias-label-primary); }
+        .pxa-text-btn.danger:hover:not(:disabled) { color: var(--dsw-alias-state-error-primary); }
+        .pxa-text-btn:disabled { cursor: not-allowed; opacity: 0.4; }
+        .pxa-btn:focus-visible,
+        .pxa-text-btn:focus-visible,
+        .pxa-site-link:focus-visible,
+        .pxa-switch:focus-visible,
+        .pxa-eye:focus-visible {
+          outline: var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+          outline-offset: 2px;
         }
 
-        .pxa-actions.tight { padding-top: 0; flex-shrink: 0; }
+        .pxa-row + .pxa-row { border-top: 0.5px solid var(--dsw-alias-border-l2); }
+        .pxa-row-main {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 24px;
+          min-height: 40px;
+          padding: 8px 0;
+        }
+        .pxa-row-text { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+        .pxa-row-title { font-size: 14px; font-weight: 400; line-height: 22px; }
+        .pxa-row-desc {
+          font-size: 12px;
+          line-height: 18px;
+          color: var(--dsw-alias-label-tertiary);
+          overflow-wrap: anywhere;
+        }
+        .pxa-row-control { flex: none; display: flex; align-items: center; gap: 8px; }
+        .pxa-tone.info { color: var(--dsw-alias-state-business-primary); }
+        .pxa-tone.warn { color: var(--dsw-alias-state-warn-label); }
+        .pxa-tone.err { color: var(--dsw-alias-state-error-primary); }
+        .pxa-row-note {
+          display: flex;
+          align-items: flex-start;
+          gap: 6px;
+          margin: 0;
+          padding-bottom: 12px;
+          font-size: 12px;
+          line-height: 18px;
+          color: var(--dsw-alias-label-tertiary);
+        }
+        .pxa-row-note.warn { color: var(--dsw-alias-state-warn-label); }
+        .pxa-row-note.err { color: var(--dsw-alias-state-error-primary); }
+        .pxa-row-note svg,
+        .pxa-msg svg,
+        .pxa-login-foot svg { flex: none; margin-top: 2px; }
 
-        a.pxa-btn { text-decoration: none; }
+        .pxa-expand {
+          display: grid;
+          grid-template-rows: 0fr;
+          margin: 0 -4px;
+          opacity: 0;
+          transition: grid-template-rows var(--pxa-slow) var(--pxa-ease), opacity var(--pxa-slow) var(--pxa-ease);
+        }
+        .pxa-expand.open { grid-template-rows: 1fr; opacity: 1; }
+        .pxa-expand-inner {
+          min-height: 0;
+          overflow: hidden;
+          padding: 0 4px;
+          visibility: hidden;
+          transition: visibility 0s linear var(--pxa-slow);
+        }
+        .pxa-expand.open > .pxa-expand-inner { visibility: visible; transition-delay: 0s; }
+        .pxa-expand.drop > .pxa-expand-inner > * {
+          transform: translateY(-4px);
+          transition: transform var(--pxa-slow) var(--pxa-ease);
+        }
+        .pxa-expand.drop.open > .pxa-expand-inner > * { transform: none; }
+
+        .pxa-edit { display: flex; flex-direction: column; gap: 12px; padding: 4px 0 16px; }
+        .pxa-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+        .pxa-label { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
+        .pxa-input,
+        .pxa-textarea {
+          box-sizing: border-box;
+          width: 100%;
+          border: 0.5px solid var(--dsw-alias-border-l3);
+          border-radius: var(--dsw-radius-md);
+          background: var(--dsw-alias-bg-layer-3);
+          color: var(--dsw-alias-label-primary);
+          font: inherit;
+          outline: none;
+          transition: border-color 150ms var(--pxa-ease), box-shadow 150ms var(--pxa-ease), opacity 150ms var(--pxa-ease);
+        }
+        .pxa-input { height: 36px; padding: 0 12px; font-size: 13px; line-height: 20px; }
+        .pxa-textarea {
+          min-height: 96px;
+          padding: 8px 12px;
+          resize: vertical;
+          font-family: var(--dsw-font-mono, var(--ds-font-family-code));
+          font-size: 12px;
+          line-height: 20px;
+        }
+        .pxa-input::placeholder,
+        .pxa-textarea::placeholder { color: var(--dsw-alias-label-dimmed); opacity: 1; }
+        .pxa-input:focus,
+        .pxa-textarea:focus {
+          border-color: var(--dsw-alias-state-business-primary);
+          box-shadow: 0 0 0 var(--dsw-focus-ring-width) color-mix(in srgb, var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary)) 20%, transparent);
+        }
+        .pxa-input[aria-invalid='true'],
+        .pxa-textarea[aria-invalid='true'] { border-color: var(--dsw-alias-state-error-primary); }
+        .pxa-input[aria-invalid='true']:focus,
+        .pxa-textarea[aria-invalid='true']:focus {
+          box-shadow: 0 0 0 var(--dsw-focus-ring-width) color-mix(in srgb, var(--dsw-alias-state-error-primary) 20%, transparent);
+        }
+        .pxa-input:disabled,
+        .pxa-textarea:disabled { cursor: not-allowed; opacity: 0.6; }
+        .pxa-input.narrow { width: 160px; font-variant-numeric: tabular-nums; }
+        .pxa-field-err,
+        .pxa-hint { margin: 0; font-size: 12px; line-height: 18px; }
+        .pxa-field-err { color: var(--dsw-alias-state-error-primary); }
+        .pxa-hint { color: var(--dsw-alias-label-tertiary); }
+        .pxa-edit-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+        .pxa-saved {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          margin-left: 4px;
+          font-size: 12px;
+          line-height: 18px;
+          color: var(--dsw-alias-state-success-primary);
+          animation: pxa-flash ${SAVED_NOTICE_MS}ms var(--pxa-ease) both;
+        }
+
+        .pxa-switch {
+          box-sizing: border-box;
+          flex: none;
+          width: 36px;
+          height: 20px;
+          padding: 2px;
+          border: 0;
+          border-radius: 999px;
+          corner-shape: round;
+          background: var(--dsw-alias-border-l3);
+          cursor: pointer;
+          transition: background-color var(--pxa-mid) var(--pxa-ease);
+        }
+        .pxa-switch.on { background: var(--dsw-alias-brand-primary); }
+        .pxa-switch[aria-busy='true'] { cursor: progress; }
+        .pxa-switch-knob {
+          display: block;
+          width: 16px;
+          height: 16px;
+          border-radius: 50%;
+          corner-shape: round;
+          background: var(--dsw-alias-switch-thumb);
+          transition: transform var(--pxa-mid) var(--pxa-ease), background-color var(--pxa-mid) var(--pxa-ease);
+        }
+        .pxa-switch.on .pxa-switch-knob {
+          transform: translateX(16px);
+          background: var(--dsw-alias-label-primary-foreground);
+        }
+
+        .pxa-notice { display: flex; align-items: center; gap: 10px; }
+        .pxa-notice-icon { flex: none; display: inline-flex; color: var(--dsw-alias-state-warn-primary); }
+        .pxa-notice-icon.err { color: var(--dsw-alias-state-error-primary); }
+        .pxa-notice-text { flex: 1; min-width: 0; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
 
         .pxa-footer {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          gap: 12px;
-          padding: 0 4px;
+          gap: 16px;
+          min-height: 28px;
+          padding: 0 16px;
           font-size: 12px;
           line-height: 18px;
-          color: var(--dsw-alias-label-tertiary, #81858c);
+          color: var(--dsw-alias-label-tertiary);
+        }
+        .pxa-footer-err { color: var(--dsw-alias-state-error-primary); }
+        .pxa-confirm {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          animation: pxa-fade var(--pxa-slow) var(--pxa-ease) both;
         }
 
-        .pxa-text-btn {
-          flex-shrink: 0;
-          padding: 0;
-          border: none;
-          background: transparent;
-          font: inherit;
-          font-size: 12px;
-          cursor: pointer;
-          color: var(--dsw-alias-label-secondary, #585a60);
-        }
-
-        .pxa-text-btn.danger { color: var(--dsw-alias-state-error-primary, #d54941); }
-        .pxa-text-btn:hover:not(:disabled) { text-decoration: underline; }
-        .pxa-text-btn:disabled { opacity: .5; cursor: not-allowed; }
-
-        .pxa-empty-hint {
-          padding: 16px;
-          text-align: center;
-          color: var(--dsw-alias-label-tertiary, #81858c);
-          border: 1px dashed var(--dsw-alias-border-l3, rgba(128,128,128,0.2));
-          border-radius: var(--dsw-radius-md, 8px);
-          font-size: 13px;
-        }
-
-        .pxa-input.narrow { max-width: 220px; font-variant-numeric: tabular-nums; }
-
-        .pxa-textarea {
-          box-sizing: border-box;
-          width: 100%;
-          min-height: 92px;
-          padding: 8px 12px;
-          border-radius: var(--dsw-radius-md, 8px);
-          border: 1px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.25));
-          background: var(--dsw-alias-bg-layer-1, #ffffff);
-          color: var(--dsw-alias-label-primary, #18191b);
-          font-size: 13px;
-          line-height: 20px;
-          font-family: var(--dsw-font-mono, monospace);
-          outline: none;
-          resize: vertical;
-          transition: border-color .15s ease, box-shadow .15s ease;
-        }
-
-        .pxa-textarea:focus {
-          border-color: var(--dsw-alias-state-business-primary, #4d6bfe);
-          box-shadow: 0 0 0 2px color-mix(in srgb, var(--dsw-alias-state-business-primary, #4d6bfe) 18%, transparent);
-        }
-
-        .pxa-textarea::placeholder { color: var(--dsw-alias-label-dimmed, #9ca3af); opacity: 1; }
-        .pxa-textarea:disabled { opacity: 0.6; cursor: not-allowed; }
-
-        .pxa-hint {
-          font-size: 12px;
-          line-height: 18px;
-          color: var(--dsw-alias-label-tertiary, #81858c);
-          margin: 0;
-        }
-
-        .pxa-saved {
-          font-size: 12px;
-          color: var(--dsw-alias-state-success-primary, #2ea043);
-        }
-
-        .pxa-switch {
+        .pxa-skel {
           position: relative;
-          flex-shrink: 0;
-          width: 40px;
-          height: 22px;
-          padding: 0;
-          border: none;
-          border-radius: 999px;
-          cursor: pointer;
-          background: var(--dsw-alias-border-l2, rgba(128,128,128,0.3));
-          transition: background-color .15s ease;
+          display: block;
+          overflow: hidden;
+          border-radius: var(--dsw-radius-xs);
+          background: var(--dsw-alias-bg-skeleton);
         }
-
-        .pxa-switch.on {
-          background: var(--dsw-alias-button-primary-fill, #4d6bfe);
-        }
-
-        .pxa-switch:disabled {
-          opacity: 0.5;
-          cursor: not-allowed;
-        }
-
-        .pxa-switch-knob {
-          position: absolute;
-          top: 3px;
-          left: 3px;
-          width: 16px;
-          height: 16px;
+        .pxa-skel.circle {
+          flex: none;
+          width: 32px;
+          height: 32px;
           border-radius: 50%;
-          background: #ffffff;
-          box-shadow: 0 1px 2px rgba(0,0,0,0.25);
-          transition: transform .15s ease;
+          corner-shape: round;
+        }
+        .pxa-skel::after {
+          content: '';
+          position: absolute;
+          inset: 0;
+          background: linear-gradient(90deg, transparent, var(--dsw-alias-bg-skeleton), transparent);
+          transform: translateX(-100%);
+          animation: pxa-shimmer 1.2s ease-in-out infinite;
+        }
+        .pxa-skel-lines { display: flex; flex-direction: column; gap: 8px; }
+
+        .pxa-login { padding: 20px 24px; }
+        .pxa-step { display: flex; flex-direction: column; gap: 16px; max-width: 400px; }
+        .pxa-step.fwd { animation: pxa-from-right var(--pxa-slow) var(--pxa-ease) both; }
+        .pxa-step.back { animation: pxa-from-left var(--pxa-slow) var(--pxa-ease) both; }
+        .pxa-login-head { display: flex; flex-direction: column; gap: 2px; }
+        .pxa-login-title { margin: 0; font-size: 15px; font-weight: 500; line-height: 22px; }
+        .pxa-login-sub {
+          margin: 0;
+          font-size: 12px;
+          line-height: 18px;
+          color: var(--dsw-alias-label-tertiary);
+          overflow-wrap: anywhere;
+        }
+        .pxa-form { display: flex; flex-direction: column; gap: 14px; margin: 0; }
+        .pxa-pass { position: relative; }
+        .pxa-pass .pxa-input { padding-right: 40px; }
+        .pxa-eye {
+          position: absolute;
+          top: 4px;
+          right: 4px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          width: 28px;
+          height: 28px;
+          padding: 0;
+          border: 0;
+          border-radius: var(--dsw-radius-sm);
+          background: transparent;
+          color: var(--dsw-alias-label-tertiary);
+          cursor: pointer;
+          transition: color var(--pxa-fast) var(--pxa-ease), background-color var(--pxa-fast) var(--pxa-ease);
+        }
+        .pxa-eye:hover:not(:disabled) { color: var(--dsw-alias-label-primary); background: var(--dsw-alias-interactive-bg-hover); }
+        .pxa-eye:disabled { cursor: not-allowed; opacity: 0.6; }
+        .pxa-msg {
+          display: flex;
+          align-items: flex-start;
+          gap: 6px;
+          margin: 0;
+          padding-bottom: 10px;
+          font-size: 12px;
+          line-height: 18px;
+          color: var(--dsw-alias-state-error-primary);
+        }
+        .pxa-msg.info { color: var(--dsw-alias-label-secondary); }
+        .pxa-slow {
+          margin: 0;
+          padding-top: 8px;
+          font-size: 12px;
+          line-height: 18px;
+          color: var(--dsw-alias-label-tertiary);
+        }
+        .pxa-login-foot {
+          display: flex;
+          align-items: flex-start;
+          gap: 6px;
+          margin: 0;
+          font-size: 12px;
+          line-height: 18px;
+          color: var(--dsw-alias-label-tertiary);
+        }
+        .pxa-otp {
+          max-width: 240px;
+          height: 48px;
+          padding: 0 0 0 0.5em;
+          font-family: var(--dsw-font-mono, var(--ds-font-family-code));
+          font-size: 20px;
+          letter-spacing: 0.5em;
+          text-align: center;
+          font-variant-numeric: tabular-nums;
+        }
+        .pxa-otp-actions { display: flex; align-items: center; gap: 16px; }
+        .pxa-otp-actions .pxa-btn.block { width: 240px; }
+
+        .pxa-spin { flex: none; animation: pxa-rotate 0.8s linear infinite; }
+        .pxa-shake { animation: pxa-shake 320ms var(--pxa-ease); }
+
+        @keyframes pxa-in { from { opacity: 0; transform: translateY(6px); } }
+        @keyframes pxa-fade { from { opacity: 0; } }
+        @keyframes pxa-from-right { from { opacity: 0; transform: translateX(12px); } }
+        @keyframes pxa-from-left { from { opacity: 0; transform: translateX(-12px); } }
+        @keyframes pxa-shake {
+          0%, 100% { transform: none; }
+          20% { transform: translateX(-4px); }
+          40% { transform: translateX(4px); }
+          60% { transform: translateX(-3px); }
+          80% { transform: translateX(2px); }
+        }
+        @keyframes pxa-rotate { to { transform: rotate(360deg); } }
+        @keyframes pxa-shimmer { to { transform: translateX(100%); } }
+        @keyframes pxa-pulse {
+          from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--dsw-alias-state-success-primary) 60%, transparent); }
+          to { box-shadow: 0 0 0 6px transparent; }
+        }
+        @keyframes pxa-flash {
+          0% { opacity: 0; }
+          11%, 89% { opacity: 1; }
+          100% { opacity: 0; }
         }
 
-        .pxa-switch.on .pxa-switch-knob { transform: translateX(18px); }
-
-        .pxa-switch-state {
-          font-size: 12px;
-          font-weight: normal;
-          color: var(--dsw-alias-label-tertiary, #81858c);
+        @media (prefers-reduced-motion: reduce) {
+          .pxa-enter,
+          .pxa-step.fwd,
+          .pxa-step.back,
+          .pxa-confirm { animation: pxa-fade var(--pxa-fast) linear both; animation-delay: 0s; }
+          .pxa-shake,
+          .pxa-dot.pulse,
+          .pxa-spin,
+          .pxa-skel::after { animation: none; }
+          .pxa-btn:active:not(:disabled) { transform: none; }
+          .pxa-switch-knob { transition: background-color var(--pxa-mid) var(--pxa-ease); }
+          .pxa-expand { transition: opacity var(--pxa-fast) linear; }
+          .pxa-expand-inner { transition: none; }
+          .pxa-expand.drop > .pxa-expand-inner > * { transform: none; transition: none; }
         }
       `
       document.head.appendChild(style)
@@ -839,6 +741,13 @@ window.__ModuleLoader__.load({
     const authOf = (section) => (section && section.auth) ? section.auth : { state: 'none', message: '', user: '', groups: [], models: -1 }
     const fillText = (t, key, vars) => Object.entries(vars).reduce(
       (text, [k, v]) => text.split('{' + k + '}').join(String(v)), t(key))
+    // 22:20, or 11-20 22:20 with the date.
+    const formatTime = (ms, withDate) => {
+      const d = new Date(ms)
+      const pad = (n) => String(n).padStart(2, '0')
+      const time = pad(d.getHours()) + ':' + pad(d.getMinutes())
+      return withDate ? pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + time : time
+    }
 
     // Context window settings. The host declares `contextWindow`, or the best
     // matching `contextWindows` rule, as each PIXEL model's capacity; Harness
@@ -883,13 +792,39 @@ window.__ModuleLoader__.load({
       return { rules }
     }
 
-    const LayersIcon = () => h('svg', { width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' },
-      h('polygon', { points: '12 2 2 7 12 12 22 7 12 2' }),
-      h('polyline', { points: '2 17 12 22 22 17' }),
-      h('polyline', { points: '2 12 12 17 22 12' })
-    )
+    function Spinner(props) {
+      const size = props.size || 14
+      return h('svg', { className: 'pxa-spin', width: size, height: size, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
+        h('circle', { cx: 12, cy: 12, r: 9, stroke: 'currentColor', strokeWidth: 2.5, opacity: 0.25 }),
+        h('path', { d: 'M21 12a9 9 0 0 0-9-9', stroke: 'currentColor', strokeWidth: 2.5, strokeLinecap: 'round' }))
+    }
 
-    function ContextCard(props) {
+    // Height-animated disclosure (grid rows 0fr ↔ 1fr, with a fade). While
+    // closing it keeps the content it last showed, so that content folds
+    // away instead of vanishing first. Other props (id, role) go on the
+    // outer element, which always renders and can carry a live region.
+    function Expand(props) {
+      const { open, className, children, ...rest } = props
+      const shown = useRef(null)
+      if (open) shown.current = children
+      return h('div', { ...rest, className: 'pxa-expand' + (open ? ' open' : '') + (className ? ' ' + className : '') },
+        h('div', { className: 'pxa-expand-inner' }, shown.current))
+    }
+
+    // A settings row: title and one line of description on the left, the
+    // control on the right, optional folding content (children) below.
+    function SettingRow(props) {
+      const { title, desc, control, labelId, live, children } = props
+      return h('div', { className: 'pxa-row' },
+        h('div', { className: 'pxa-row-main' },
+          h('div', { className: 'pxa-row-text' },
+            h('span', { className: 'pxa-row-title', id: labelId }, title),
+            h('span', { className: 'pxa-row-desc', id: labelId ? labelId + '-desc' : undefined, role: live ? 'status' : undefined }, desc)),
+          h('div', { className: 'pxa-row-control' }, control)),
+        children)
+    }
+
+    function ContextRow(props) {
       const { api, t, section, reload } = props
       const stored = Number(section && section.contextWindow)
       const currentWindow = Number.isSafeInteger(stored) && stored > 0 ? stored : DEFAULT_CONTEXT_WINDOW
@@ -898,20 +833,30 @@ window.__ModuleLoader__.load({
       const sourceKey = currentWindow + '\n' + formatRules(currentRules)
       const fresh = () => ({ window: String(currentWindow), rules: formatRules(currentRules), dirty: false, source: sourceKey })
       const [form, setForm] = useState(fresh)
+      const [open, setOpen] = useState(false)
       const [saving, setSaving] = useState(false)
+      // { field: 'window' | 'rules' | 'save', text }
       const [error, setError] = useState(null)
-      const [saved, setSaved] = useState(false)
+      // When the last save landed (0: no 「已保存」 on screen).
+      const [savedAt, setSavedAt] = useState(0)
+      const [shaking, setShaking] = useState(false)
+      const id = useId()
 
       // Follow the stored value until the user edits: a host status write
       // landing mid-edit must not wipe what they typed.
       useEffect(() => {
         setForm((f) => (f.dirty || f.source === sourceKey ? f : fresh()))
       }, [sourceKey])
+      useEffect(() => {
+        if (!savedAt) return undefined
+        const timer = setTimeout(() => setSavedAt(0), SAVED_NOTICE_MS)
+        return () => clearTimeout(timer)
+      }, [savedAt])
 
       const commit = async (windowValue, rules) => {
         setSaving(true)
         setError(null)
-        setSaved(false)
+        setSavedAt(0)
         try {
           await api.settings.mutate(NS, [
             { op: 'set', path: ['contextWindow'], value: windowValue },
@@ -919,100 +864,122 @@ window.__ModuleLoader__.load({
           ])
           const text = formatRules(rules)
           setForm({ window: String(windowValue), rules: text, dirty: false, source: windowValue + '\n' + text })
-          setSaved(true)
+          setSavedAt(Date.now())
           // Refetch the section so the summary shows the stored value even if
           // no settings/document-updated event reaches this page.
           if (typeof reload === 'function') void reload()
         } catch (e) {
-          setError(msg(e))
+          setError({ field: 'save', text: msg(e) })
         } finally {
           setSaving(false)
         }
       }
+      const reject = (field, text) => {
+        setSavedAt(0)
+        setError({ field, text })
+        setShaking(true)
+      }
       const save = () => {
         const windowValue = parseTokens(form.window)
         if (windowValue === undefined || windowValue < MIN_CONTEXT_WINDOW) {
-          setSaved(false)
-          setError(t('err.ctx.default'))
+          reject('window', t('err.ctx.default'))
           return
         }
         const parsed = parseRules(form.rules, t)
         if (parsed.error) {
-          setSaved(false)
-          setError(parsed.error)
+          reject('rules', parsed.error)
           return
         }
         void commit(windowValue, parsed.rules)
       }
-      const edit = (patch) => {
-        setSaved(false)
-        setForm((f) => ({ ...f, ...patch, dirty: true }))
+      const edit = (field, value) => {
+        setSavedAt(0)
+        setError((e) => (e !== null && (e.field === field || e.field === 'save') ? null : e))
+        setForm((f) => ({ ...f, [field]: value, dirty: true }))
       }
+      const invalid = (field) => error !== null && error.field === field
+      const errorLine = (field) => (invalid(field) ? h('p', { id: id + '-err', className: 'pxa-field-err' }, error.text) : null)
       const ruleCount = Object.keys(currentRules).length
       const isDefault = currentWindow === DEFAULT_CONTEXT_WINDOW && ruleCount === 0
 
-      return h('div', { className: 'pxa-card' },
-        h('div', { className: 'pxa-card-head' },
-          h('div', { className: 'pxa-card-title' }, h(LayersIcon, null), t('ctx.title')),
-          h('span', { className: 'pxa-hint' },
-            fillText(t, 'ctx.summary', { window: currentWindow.toLocaleString(), rules: ruleCount })),
-        ),
-        h('p', { className: 'pxa-desc' }, t('ctx.desc')),
-        error ? h('div', { className: 'pxa-banner err' }, error) : null,
-        h('div', { className: 'pxa-form' },
-          h('div', { className: 'pxa-field' },
-            h('label', { className: 'pxa-label' }, t('ctx.default')),
-            h('input', {
-              className: 'pxa-input narrow',
-              value: form.window,
-              inputMode: 'numeric',
-              placeholder: String(DEFAULT_CONTEXT_WINDOW),
-              disabled: saving,
-              onChange: (e) => edit({ window: e.target.value }),
-              onKeyDown: (e) => { if (e.key === 'Enter' && !saving && form.dirty) save() },
-            }),
-          ),
-          h('div', { className: 'pxa-field' },
-            h('label', { className: 'pxa-label' }, t('ctx.overrides')),
-            h('textarea', {
-              className: 'pxa-textarea',
-              value: form.rules,
-              placeholder: t('ctx.overrides.placeholder'),
-              spellCheck: false,
-              disabled: saving,
-              onChange: (e) => edit({ rules: e.target.value }),
-            }),
-            h('p', { className: 'pxa-hint' }, t('ctx.hint')),
-          ),
-          h('div', { className: 'pxa-actions' },
-            h('button', { className: 'pxa-btn primary', disabled: saving || !form.dirty, onClick: save },
-              saving ? t('ctx.saving') : t('ctx.save')),
-            h('button', {
-              className: 'pxa-btn',
-              disabled: saving || (isDefault && !form.dirty),
-              onClick: () => void commit(DEFAULT_CONTEXT_WINDOW, {}),
-            }, t('ctx.reset')),
-            saved ? h('span', { className: 'pxa-saved' }, t('ctx.saved')) : null,
-          ),
-        ),
-      )
+      return h(SettingRow, {
+        title: t('ctx.title'),
+        desc: fillText(t, 'ctx.summary', { window: currentWindow.toLocaleString(), rules: ruleCount }),
+        control: h('button', {
+          type: 'button',
+          className: 'pxa-btn',
+          'aria-expanded': open,
+          'aria-controls': id + '-edit',
+          onClick: () => setOpen((v) => !v),
+        }, open ? t('ctx.collapse') : t('ctx.edit')),
+      },
+        h(Expand, { open, id: id + '-edit' },
+          h('div', {
+            className: 'pxa-edit' + (shaking ? ' pxa-shake' : ''),
+            onAnimationEnd: (e) => { if (e.target === e.currentTarget) setShaking(false) },
+          },
+            h('p', { className: 'pxa-hint' }, t('ctx.desc')),
+            h('div', { className: 'pxa-field' },
+              h('label', { className: 'pxa-label', htmlFor: id + '-window' }, t('ctx.default')),
+              h('input', {
+                id: id + '-window',
+                className: 'pxa-input narrow',
+                value: form.window,
+                inputMode: 'numeric',
+                placeholder: String(DEFAULT_CONTEXT_WINDOW),
+                disabled: saving,
+                'aria-invalid': invalid('window'),
+                'aria-describedby': invalid('window') ? id + '-err' : undefined,
+                onChange: (e) => edit('window', e.target.value),
+                onKeyDown: (e) => { if (e.key === 'Enter' && !saving && form.dirty) save() },
+              }),
+              errorLine('window')),
+            h('div', { className: 'pxa-field' },
+              h('label', { className: 'pxa-label', htmlFor: id + '-rules' }, t('ctx.overrides')),
+              h('textarea', {
+                id: id + '-rules',
+                className: 'pxa-textarea',
+                rows: 4,
+                value: form.rules,
+                placeholder: t('ctx.overrides.placeholder'),
+                spellCheck: false,
+                disabled: saving,
+                'aria-invalid': invalid('rules'),
+                'aria-describedby': invalid('rules') ? id + '-err' : undefined,
+                onChange: (e) => edit('rules', e.target.value),
+              }),
+              errorLine('rules'),
+              h('p', { className: 'pxa-hint' }, t('ctx.hint'))),
+            h('div', { className: 'pxa-edit-actions' },
+              h('button', {
+                type: 'button',
+                className: 'pxa-btn primary',
+                disabled: saving || !form.dirty,
+                'aria-busy': saving,
+                onClick: save,
+              }, saving ? h(Spinner) : null, saving ? t('ctx.saving') : t('ctx.save')),
+              h('button', {
+                type: 'button',
+                className: 'pxa-btn',
+                disabled: saving || (isDefault && !form.dirty),
+                onClick: () => void commit(DEFAULT_CONTEXT_WINDOW, {}),
+              }, t('ctx.reset')),
+              savedAt ? h('span', { key: savedAt, className: 'pxa-saved', role: 'status' }, h(CheckIcon), t('ctx.saved')) : null),
+            errorLine('save'))))
     }
-
-    const SparkIcon = () => h('svg', { width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' },
-      h('path', { d: 'M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M18.4 5.6l-2.8 2.8M8.4 15.6l-2.8 2.8' })
-    )
 
     // GPT encrypted-reasoning passback. Off by default: the host sends the
     // site's replay token back only when this is on (index.js serializeAssistant).
     // The toggle writes the volatile `openaiReasoningReplay` field; the host
     // reads it live, so it applies from the next request without a reload.
-    function ReplayCard(props) {
+    function ReplayRow(props) {
       const { api, t, section, reload } = props
       const stored = !!(section && section.openaiReasoningReplay)
       const [busy, setBusy] = useState(false)
       const [error, setError] = useState(null)
       // Intended value while a write is in flight; null follows the stored one.
       const [optimistic, setOptimistic] = useState(null)
+      const id = useId()
       const on = optimistic === null ? stored : optimistic
       useEffect(() => {
         if (optimistic !== null && optimistic === stored) setOptimistic(null)
@@ -1030,42 +997,39 @@ window.__ModuleLoader__.load({
           .finally(() => setBusy(false))
       }
 
-      return h('div', { className: 'pxa-card' },
-        h('div', { className: 'pxa-card-head' },
-          h('div', { className: 'pxa-card-title' }, h(SparkIcon, null), t('replay.title')),
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
-            h('span', { className: 'pxa-switch-state' }, on ? t('replay.on') : t('replay.off')),
-            h('button', {
-              type: 'button',
-              className: 'pxa-switch' + (on ? ' on' : ''),
-              role: 'switch',
-              'aria-checked': on,
-              disabled: busy,
-              onClick: toggle,
-            }, h('span', { className: 'pxa-switch-knob' })),
-          ),
-        ),
-        h('p', { className: 'pxa-desc' }, t('replay.desc')),
-        error ? h('div', { className: 'pxa-banner err' }, error) : null,
-      )
+      return h(SettingRow, {
+        title: t('replay.title'),
+        desc: t('replay.summary'),
+        labelId: id,
+        control: h('button', {
+          type: 'button',
+          className: 'pxa-switch' + (on ? ' on' : ''),
+          role: 'switch',
+          'aria-checked': on,
+          'aria-labelledby': id,
+          'aria-describedby': id + '-desc',
+          'aria-busy': busy,
+          onClick: toggle,
+        }, h('span', { className: 'pxa-switch-knob' })),
+      },
+        h(Expand, { open: on },
+          h('p', { className: 'pxa-row-note warn' }, h(AlertIcon), h('span', null, t('replay.desc')))),
+        h(Expand, { open: error !== null, role: 'status' },
+          h('p', { className: 'pxa-row-note err' }, error)))
     }
 
-    const RefreshIcon = () => h('svg', { width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' },
-      h('polyline', { points: '23 4 23 10 17 10' }),
-      h('path', { d: 'M20.49 15a9 9 0 1 1-2.12-9.36L23 10' })
-    )
-
-    // Plugin updates. The host does the work (it reads release tags with git
-    // and runs the plugin manager's update); this card only bumps
+    // Plugin version and updates. The host does the work (it reads release
+    // tags with git and runs the plugin manager's update); this row only bumps
     // updateCheckAt / updateApplyAt and renders the `update` status the host
     // writes back. Nothing is checked unless the person asks.
-    function UpdateCard(props) {
+    function VersionRow(props) {
       const { api, t, section, reload } = props
       const u = (section && section.update) || {}
       const state = String(u.state || 'idle')
       const [confirming, setConfirming] = useState(false)
       const [sent, setSent] = useState(null)
       const [error, setError] = useState(null)
+      const id = useId()
       // A request is pending until the host records serving it.
       const servedFor = (kind) => Number(kind === 'check' ? u.servedCheckAt : u.servedApplyAt) || 0
       const pending = sent !== null && sent.at > servedFor(sent.kind)
@@ -1076,7 +1040,8 @@ window.__ModuleLoader__.load({
         const giveUp = setTimeout(() => setSent(null), 30000)
         return () => { clearInterval(poll); clearTimeout(giveUp) }
       }, [pending, reload])
-      const busy = pending || state === 'checking' || state === 'updating'
+      const checking = state === 'checking' || (pending && sent.kind === 'check')
+      const applying = state === 'updating' || (pending && sent.kind === 'apply')
       const request = (kind) => {
         const at = Date.now()
         setError(null)
@@ -1087,56 +1052,341 @@ window.__ModuleLoader__.load({
       }
 
       const reason = u.message || '—'
-      let line = t('upd.idle')
-      let tone = null
-      if (state === 'checking' || (pending && sent && sent.kind === 'check')) line = t('upd.checking')
-      else if (state === 'latest') line = fillText(t, 'upd.latest', { version: u.latest || u.current })
-      else if (state === 'available') { line = fillText(t, 'upd.available', { version: u.latest }); tone = 'info' }
-      else if (state === 'unsupported') { line = fillText(t, 'upd.unsupported', { version: u.latest, reason }); tone = 'warn' }
-      else if (state === 'error') { line = fillText(t, 'upd.error', { reason }); tone = 'err' }
-      else if (state === 'updating') { line = fillText(t, 'upd.updating', { version: u.target }); tone = 'info' }
-      else if (state === 'updated') { line = fillText(t, 'upd.updated', { version: u.current }); tone = 'info' }
-      else if (state === 'restart') { line = fillText(t, 'upd.restart', { version: u.target }); tone = 'warn' }
-      else if (state === 'failed') { line = fillText(t, 'upd.failed', { reason }); tone = 'err' }
+      let status = t('upd.idle')
+      let tone = ''
+      if (error) { status = error; tone = 'err' }
+      else if (checking) status = t('upd.checking')
+      else if (state === 'latest') status = t('upd.latest')
+      else if (state === 'available') { status = fillText(t, 'upd.available', { version: u.latest }); tone = 'info' }
+      else if (state === 'unsupported') { status = fillText(t, 'upd.unsupported', { version: u.latest, reason }); tone = 'warn' }
+      else if (state === 'error') { status = fillText(t, 'upd.error', { reason }); tone = 'err' }
+      else if (state === 'updating') status = fillText(t, 'upd.updating', { version: u.target })
+      else if (state === 'updated') status = fillText(t, 'upd.updated', { version: u.current })
+      else if (state === 'restart') { status = fillText(t, 'upd.restart', { version: u.target }); tone = 'warn' }
+      else if (state === 'failed') { status = fillText(t, 'upd.failed', { reason }); tone = 'err' }
       const checkedAt = Number(u.checkedAt) || 0
+      const stamp = checkedAt > 0 && !error && !checking && (state === 'latest' || state === 'available')
+        ? fillText(t, 'upd.checkedAt', { time: formatTime(checkedAt, true) })
+        : ''
       const available = state === 'available' && !!u.latest
 
-      return h('div', { className: 'pxa-card' },
-        h('div', { className: 'pxa-card-head' },
-          h('div', { className: 'pxa-card-title' }, h(RefreshIcon, null), t('upd.title')),
-          u.current ? h('span', { className: 'pxa-hint' }, fillText(t, 'upd.version', { version: u.current })) : null,
-        ),
-        tone ? h('div', { className: 'pxa-banner ' + tone }, line) : h('p', { className: 'pxa-desc' }, line),
-        available ? h('p', { className: 'pxa-hint' }, t('upd.availableHint')) : null,
-        error ? h('div', { className: 'pxa-banner err' }, error) : null,
-        h('div', { className: 'pxa-actions' },
-          available && confirming
-            ? h(React.Fragment, null,
-              h('button', { className: 'pxa-btn primary', disabled: busy, onClick: () => request('apply') }, t('upd.confirm')),
-              h('button', { className: 'pxa-btn', disabled: busy, onClick: () => setConfirming(false) }, t('upd.cancel')))
-            : available
-              ? h('button', { className: 'pxa-btn primary', disabled: busy, onClick: () => setConfirming(true) },
-                fillText(t, 'upd.apply', { version: u.latest }))
-              : null,
-          !(available && confirming)
-            ? h('button', { className: 'pxa-btn', disabled: busy, onClick: () => request('check') }, t('upd.check'))
-            : null,
-          checkedAt > 0 && !busy
-            ? h('span', { className: 'pxa-hint' }, fillText(t, 'upd.checkedAt', {
-              time: new Date(checkedAt).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }),
-            }))
-            : null,
-        ),
-      )
+      let control
+      if (applying) {
+        control = h('button', { type: 'button', className: 'pxa-btn', disabled: true, 'aria-busy': true },
+          h(Spinner), t('upd.applying'))
+      } else if (available && confirming) {
+        control = h(React.Fragment, null,
+          h('button', { type: 'button', className: 'pxa-btn primary', 'aria-describedby': id + '-hint', onClick: () => request('apply') },
+            t('upd.confirm')),
+          h('button', { type: 'button', className: 'pxa-btn', onClick: () => setConfirming(false) }, t('action.cancel')))
+      } else if (available) {
+        control = h('button', { type: 'button', className: 'pxa-btn primary', onClick: () => setConfirming(true) },
+          fillText(t, 'upd.apply', { version: u.latest }))
+      } else {
+        control = h('button', {
+          type: 'button',
+          className: 'pxa-btn',
+          disabled: checking,
+          'aria-busy': checking,
+          onClick: () => request('check'),
+        }, checking ? h(Spinner) : null, t('upd.check'))
+      }
+
+      return h(SettingRow, {
+        title: t('upd.title'),
+        live: true,
+        desc: h(React.Fragment, null,
+          u.current && state !== 'updated' ? 'v' + u.current + ' · ' : null,
+          h('span', { className: tone ? 'pxa-tone ' + tone : undefined }, status),
+          stamp ? ' · ' + stamp : null),
+        control,
+      },
+        h(Expand, { open: available && confirming && !applying },
+          h('p', { id: id + '-hint', className: 'pxa-row-note' }, t('upd.availableHint'))))
+    }
+
+    function IdentityCard(props) {
+      const { t, name, detail, connected, pulse, onPulseEnd } = props
+      const initial = Array.from(name)[0] || ''
+      return h('div', { className: 'pxa-card pxa-identity' },
+        h('div', { className: 'pxa-who' },
+          h('span', { className: 'pxa-avatar', 'aria-hidden': true }, initial.toUpperCase()),
+          h('div', { className: 'pxa-who-text' },
+            h('span', { className: 'pxa-name' }, name || '—'),
+            h('span', { className: 'pxa-who-sub' },
+              detail ? h('span', null, detail) : null,
+              detail ? h('span', { 'aria-hidden': true }, '·') : null,
+              h('span', { className: 'pxa-conn', role: 'status' },
+                h('span', {
+                  className: 'pxa-dot' + (connected ? '' : ' warn') + (pulse ? ' pulse' : ''),
+                  onAnimationEnd: onPulseEnd,
+                }),
+                connected ? t('status.ok') : t('status.interrupted'))))),
+        h('a', { className: 'pxa-site-link', href: SITE_URL + '/', target: '_blank', rel: 'noreferrer' },
+          t('action.openSite'), h(ArrowUpRightIcon)))
+    }
+
+    function BalanceCard(props) {
+      const { t, profile, refreshing, error, onRefresh } = props
+      const usage = profile.updatedAt
+        ? [
+          profile.used ? fillText(t, 'ok.used', { used: profile.used }) : '',
+          fillText(t, 'ok.requests', { count: Number(profile.requests || 0).toLocaleString() }),
+          fillText(t, 'ok.updated', { time: formatTime(profile.updatedAt, false) }),
+        ].filter(Boolean).join(' · ')
+        : ''
+      return h('div', { className: 'pxa-card pxa-balance' },
+        h('div', { className: 'pxa-line' },
+          h('span', null, t('ok.balance')),
+          h('span', { className: 'pxa-amount' + (refreshing ? ' dim' : '') }, profile.balance || '—')),
+        h('div', { className: 'pxa-divider' }),
+        h('div', { className: 'pxa-line' },
+          h('span', { className: 'pxa-meta' + (error ? ' err' : ''), role: 'status' }, error || usage),
+          h('div', { className: 'pxa-actions' },
+            h('button', {
+              type: 'button',
+              className: 'pxa-btn',
+              disabled: refreshing,
+              'aria-busy': refreshing,
+              onClick: onRefresh,
+            }, refreshing ? h(Spinner) : null, refreshing ? t('action.refreshing') : t('action.refresh')),
+            h('a', { className: 'pxa-btn primary', href: SITE_URL + '/wallet', target: '_blank', rel: 'noreferrer' },
+              t('action.topup')))))
+    }
+
+    // One line of status with one action: the settings read failing, or the
+    // session kept while the site cannot be reached.
+    function NoticeCard(props) {
+      const { tone, text, action, busy, onAction } = props
+      return h('div', { className: 'pxa-card pxa-notice' },
+        h('span', { className: 'pxa-notice-icon ' + tone }, h(AlertIcon, { size: 16 })),
+        h('span', { className: 'pxa-notice-text', role: 'status' }, text),
+        h('button', { type: 'button', className: 'pxa-btn', disabled: busy, 'aria-busy': busy, onClick: onAction },
+          busy ? h(Spinner) : null, action))
+    }
+
+    function AccountFooter(props) {
+      const { t, mounted, busy, error, onSignOut } = props
+      // idle → confirm; cancelling returns to the trigger with focus on it.
+      const [mode, setMode] = useState('idle')
+      return h('div', { className: 'pxa-footer' },
+        h('span', { className: error ? 'pxa-footer-err' : undefined, role: 'status' }, error || mounted),
+        mode === 'confirm'
+          ? h('div', { className: 'pxa-confirm' },
+            h('span', null, t('logout.confirm')),
+            h('button', {
+              type: 'button',
+              className: 'pxa-btn sm danger',
+              disabled: busy,
+              'aria-busy': busy,
+              onClick: onSignOut,
+            }, busy ? h(Spinner, { size: 12 }) : null, t('action.logout')),
+            h('button', { type: 'button', className: 'pxa-btn sm', disabled: busy, autoFocus: true, onClick: () => setMode('cancelled') },
+              t('action.cancel')))
+          : h('button', {
+            type: 'button',
+            className: 'pxa-text-btn danger',
+            autoFocus: mode === 'cancelled',
+            onClick: () => setMode('confirm'),
+          }, t('action.logout')))
+    }
+
+    // Login card: the password step, and the TOTP step of a 2FA challenge in
+    // the same frame. Progress comes from the parent (`signingIn`,
+    // `verifying`); `failures` counts sign-ins from this page that came back
+    // with an error, each of which shakes the card and asks for the password.
+    function LoginCard(props) {
+      const {
+        t, step, initialUsername, user, message, signingIn, verifying, cancelling, failures,
+        onLogin, onVerify, onBack,
+      } = props
+      const [form, setForm] = useState(() => ({ username: initialUsername, password: '', otp: '' }))
+      const [missing, setMissing] = useState({ username: false, password: false })
+      const [showPassword, setShowPassword] = useState(false)
+      const [shaking, setShaking] = useState(false)
+      const [slow, setSlow] = useState(false)
+      // The step on screen, and how the latest step change slides in.
+      const [shownStep, setShownStep] = useState(step)
+      const [slide, setSlide] = useState('')
+      const seenFailures = useRef(failures)
+      const usernameRef = useRef(null)
+      const passwordRef = useRef(null)
+      const id = useId()
+
+      if (shownStep !== step) {
+        setShownStep(step)
+        setSlide(step === 'otp' ? 'fwd' : 'back')
+      }
+      useEffect(() => {
+        setSlow(false)
+        if (!signingIn) return undefined
+        const timer = setTimeout(() => setSlow(true), SLOW_SIGN_IN_MS)
+        return () => clearTimeout(timer)
+      }, [signingIn])
+      useEffect(() => {
+        if (failures === seenFailures.current) return
+        seenFailures.current = failures
+        setShaking(true)
+        setForm((f) => ({ ...f, password: '', otp: '' }))
+        if (passwordRef.current) passwordRef.current.focus()
+      }, [failures])
+
+      const change = (field) => (e) => {
+        const value = e.target.value
+        setForm((f) => ({ ...f, [field]: value }))
+        setMissing((m) => (m[field] ? { ...m, [field]: false } : m))
+      }
+      const submitLogin = (e) => {
+        e.preventDefault()
+        if (signingIn) return
+        const name = form.username.trim()
+        const absent = { username: name === '', password: form.password === '' }
+        if (absent.username || absent.password) {
+          setMissing(absent)
+          setShaking(true)
+          const first = absent.username ? usernameRef.current : passwordRef.current
+          if (first) first.focus()
+          return
+        }
+        // The host holds the password from here on; drop it from the field.
+        void onLogin(name, form.password).then(() => setForm((f) => ({ ...f, password: '' })))
+      }
+      const submitOtp = (code) => {
+        if (verifying || cancelling || code.length < OTP_LENGTH) return
+        void onVerify(code)
+      }
+      const typeOtp = (e) => {
+        const code = e.target.value.replace(/\D/g, '').slice(0, OTP_LENGTH)
+        setForm((f) => ({ ...f, otp: code }))
+        if (code.length === OTP_LENGTH) submitOtp(code)
+      }
+      const back = () => {
+        setForm((f) => ({ ...f, otp: '' }))
+        void onBack()
+      }
+
+      const messageId = id + '-msg'
+      const messageLine = message
+        ? h('p', { id: messageId, className: 'pxa-msg' + (message.tone === 'info' ? ' info' : '') },
+          h(AlertIcon), h('span', null, message.text))
+        : null
+      const head = (title, sub) => h('div', { className: 'pxa-login-head' },
+        h('h2', { className: 'pxa-login-title' }, title),
+        h('p', { className: 'pxa-login-sub' }, sub))
+      const stepClass = 'pxa-step' + (slide ? ' ' + slide : '')
+
+      let content
+      if (step === 'otp') {
+        content = h('div', { key: 'otp', className: stepClass },
+          head(t('otp.title'), fillText(t, 'otp.subtitle', { user })),
+          h('form', { className: 'pxa-form', onSubmit: (e) => { e.preventDefault(); submitOtp(form.otp) } },
+            h('input', {
+              className: 'pxa-input pxa-otp',
+              value: form.otp,
+              inputMode: 'numeric',
+              autoComplete: 'one-time-code',
+              autoFocus: true,
+              maxLength: OTP_LENGTH,
+              disabled: verifying || cancelling,
+              'aria-label': t('field.otp'),
+              'aria-describedby': message ? messageId : undefined,
+              onChange: typeOtp,
+            }),
+            h('div', null,
+              h(Expand, { open: message !== null, className: 'drop', role: 'status' }, messageLine),
+              h('div', { className: 'pxa-otp-actions' },
+                h('button', {
+                  type: 'submit',
+                  className: 'pxa-btn primary block',
+                  disabled: verifying || cancelling || form.otp.length < OTP_LENGTH,
+                  'aria-busy': verifying,
+                }, verifying ? h(Spinner) : null, verifying ? t('action.verifying') : t('action.verify')),
+                h('button', { type: 'button', className: 'pxa-text-btn md', disabled: verifying || cancelling, onClick: back },
+                  t('action.back'))))))
+      } else {
+        content = h('div', { key: 'password', className: stepClass },
+          head(t('login.title'), fillText(t, 'login.subtitle', { site: SITE_HOST })),
+          h('form', { className: 'pxa-form', onSubmit: submitLogin },
+            h('div', { className: 'pxa-field' },
+              h('label', { className: 'pxa-label', htmlFor: id + '-user' }, t('field.username')),
+              h('input', {
+                ref: usernameRef,
+                id: id + '-user',
+                className: 'pxa-input',
+                name: 'username',
+                value: form.username,
+                autoComplete: 'username',
+                autoCapitalize: 'off',
+                spellCheck: false,
+                disabled: signingIn,
+                'aria-invalid': missing.username,
+                'aria-describedby': missing.username ? id + '-user-err' : undefined,
+                onChange: change('username'),
+              }),
+              missing.username ? h('p', { id: id + '-user-err', className: 'pxa-field-err' }, t('err.username')) : null),
+            h('div', { className: 'pxa-field' },
+              h('label', { className: 'pxa-label', htmlFor: id + '-pass' }, t('field.password')),
+              h('div', { className: 'pxa-pass' },
+                h('input', {
+                  ref: passwordRef,
+                  id: id + '-pass',
+                  className: 'pxa-input',
+                  name: 'password',
+                  type: showPassword ? 'text' : 'password',
+                  value: form.password,
+                  autoComplete: 'current-password',
+                  autoFocus: slide === 'back',
+                  disabled: signingIn,
+                  'aria-invalid': missing.password,
+                  'aria-describedby': [
+                    missing.password ? id + '-pass-err' : '',
+                    message && message.tone === 'err' ? messageId : '',
+                  ].filter(Boolean).join(' ') || undefined,
+                  onChange: change('password'),
+                }),
+                h('button', {
+                  type: 'button',
+                  className: 'pxa-eye',
+                  title: showPassword ? t('action.hidePassword') : t('action.showPassword'),
+                  'aria-label': showPassword ? t('action.hidePassword') : t('action.showPassword'),
+                  disabled: signingIn,
+                  onClick: () => setShowPassword((v) => !v),
+                }, showPassword ? h(EyeOffIcon) : h(EyeIcon))),
+              missing.password ? h('p', { id: id + '-pass-err', className: 'pxa-field-err' }, t('err.password')) : null),
+            h('div', null,
+              h(Expand, { open: message !== null, className: 'drop', role: 'status' }, messageLine),
+              h('button', { type: 'submit', className: 'pxa-btn primary block', disabled: signingIn, 'aria-busy': signingIn },
+                signingIn ? h(Spinner) : null, signingIn ? t('action.loggingIn') : t('action.login')),
+              h(Expand, { open: signingIn && slow, role: 'status' },
+                h('p', { className: 'pxa-slow' }, t('login.slow'))))),
+          h('p', { className: 'pxa-login-foot' }, h(ShieldIcon), h('span', null, t('hint.session'))))
+      }
+
+      return h('div', {
+        className: 'pxa-card pxa-login' + (shaking ? ' pxa-shake' : ''),
+        onAnimationEnd: (e) => { if (e.target === e.currentTarget) setShaking(false) },
+      }, content)
     }
 
     function PixelSection(props) {
       const { api, remote, t } = props
       const [view, setView] = useState({ status: 'loading', error: null, section: null, creds: {} })
-      const [form, setForm] = useState({ username: '', password: '', otp: '' })
-      const [showPassword, setShowPassword] = useState(false)
-      const [busy, setBusy] = useState(false)
+      // Page action in flight (login | verify | cancel | logout) and its wire failure.
+      const [action, setAction] = useState(null)
       const [notice, setNotice] = useState(null)
+      // A sign-in submitted here and the auth status it started from:
+      // { kind: 'login' | 'verify', state, message }. See the outcome effect.
+      const [attempt, setAttempt] = useState(null)
+      const [failures, setFailures] = useState(0)
+      // A sign-in from this page just connected: the status dot pulses once.
+      const [welcome, setWelcome] = useState(false)
+      // Host reason for a refused 2FA code (the challenge ended in an error).
+      const [otpFailure, setOtpFailure] = useState(null)
+      const [reloading, setReloading] = useState(false)
+      const [refreshing, setRefreshing] = useState(false)
+      const [refreshError, setRefreshError] = useState(null)
+      const refreshTimer = useRef(null)
+      const autoRefreshed = useRef(false)
       const generationRef = useRef(0)
 
       const load = useCallback(async () => {
@@ -1171,54 +1421,95 @@ window.__ModuleLoader__.load({
         return () => { for (const dispose of disposers) dispose() }
       }, [remote, load])
 
-      const run = useCallback(async (fn) => {
-        setBusy(true)
+      // The host consumes a credential when its step ends, whatever the
+      // outcome: a configured password means a sign-in is in flight, a
+      // configured 2FA code a code being checked, and the refresh credential
+      // is the session itself.
+      const auth = authOf(view.section)
+      const username = (view.section && view.section.username) || ''
+      const configured = (ref) => !!(view.creds[ref] && view.creds[ref].configured)
+      const session = configured(REFS.refresh)
+      // The status this page's sign-in started from is not that sign-in's outcome.
+      const stale = attempt !== null && auth.state === attempt.state && auth.message === attempt.message
+      let phase = view.status
+      if (view.status === 'ready') {
+        if (auth.state === 'ok') phase = 'connected'
+        else if (session) phase = auth.state === 'error' && !stale ? 'interrupted' : 'connecting'
+        else if (auth.state === '2fa') phase = '2fa'
+        else phase = 'login'
+      }
+
+      // Leaving the 2FA step on an error means the code was refused.
+      const [seenPhase, setSeenPhase] = useState(phase)
+      if (seenPhase !== phase) {
+        setSeenPhase(phase)
+        if (seenPhase === '2fa' && phase === 'login' && auth.state === 'error') setOtpFailure(auth.message)
+      }
+
+      // Outcome of a sign-in this page submitted, read once the host has
+      // consumed its credential. The host skips writing a status equal to
+      // the current one, so a repeated refusal shows up only as the
+      // credential going away under an unchanged error.
+      const credPending = attempt !== null && configured(attempt.kind === 'login' ? REFS.password : REFS.otp)
+      useEffect(() => {
+        if (attempt === null || action !== null || credPending) return
+        if (auth.state === 'ok') {
+          setAttempt(null)
+          setWelcome(true)
+        } else if (session) {
+          // Signed in, groups still loading: wait for 'ok', or a new error.
+          if (auth.state === 'error' && !stale) setAttempt(null)
+        } else if (auth.state === '2fa') {
+          if (attempt.kind === 'login') setAttempt(null)
+        } else if (auth.state === 'error') {
+          setAttempt(null)
+          setFailures((n) => n + 1)
+        }
+      }, [attempt, action, credPending, session, stale, auth.state])
+
+      const run = useCallback(async (name, fn) => {
+        setAction(name)
         setNotice(null)
         try {
           await fn()
         } catch (error) {
+          // A failed wire call leaves no sign-in of this page in flight.
+          setAttempt(null)
           setNotice(msg(error))
         } finally {
-          setBusy(false)
+          setAction(null)
         }
       }, [])
 
-      const login = () => run(async () => {
-        const username = form.username.trim()
-        const password = form.password
-        if (!username || !password) {
-          setNotice(t('err.required'))
-          return
-        }
-        await api.settings.mutate(NS, [{ op: 'set', path: ['username'], value: username }])
+      const login = (name, password) => run('login', async () => {
+        setOtpFailure(null)
+        setAttempt({ kind: 'login', state: auth.state, message: auth.message })
+        await api.settings.mutate(NS, [{ op: 'set', path: ['username'], value: name }])
         await api.credentials.set(REFS.password, password)
-        setForm((f) => ({ ...f, password: '' }))
+        // Read the host's view before the action clears, so the button
+        // never flashes idle between the two.
+        await load()
       })
 
-      const verify = () => run(async () => {
-        const code = form.otp.trim()
-        if (!code) {
-          setNotice(t('err.requiredOtp'))
-          return
-        }
+      const verify = (code) => run('verify', async () => {
+        setAttempt({ kind: 'verify', state: auth.state, message: auth.message })
         await api.credentials.set(REFS.otp, code)
-        setForm((f) => ({ ...f, otp: '' }))
+        await load()
       })
 
-      const cancelChallenge = () => run(async () => {
+      const cancelChallenge = () => run('cancel', async () => {
         await api.credentials.unset(REFS.otp)
         await api.credentials.unset(REFS.password)
         await api.settings.mutate(NS, [
           { op: 'set', path: ['auth'], value: { state: 'none', message: '', user: '', groups: [], models: -1 } },
         ])
-        setForm({ username: '', password: '', otp: '' })
       })
 
       // Sign-out order matters: raise signOutAt FIRST, because the host must
       // still hold the live access token and refresh cookie when it revokes the
       // site session. Clearing credentials first would tear the session down
       // locally and leave the site session alive.
-      const logout = () => run(async () => {
+      const logout = () => run('logout', async () => {
         await api.settings.mutate(NS, [
           { op: 'set', path: ['signOutAt'], value: Date.now() },
           { op: 'set', path: ['username'], value: '' },
@@ -1229,281 +1520,128 @@ window.__ModuleLoader__.load({
         }
       })
 
-      // Ask the host to refetch balance + groups. The host serves each newer
-      // refreshAt once; the page re-renders when the auth status it writes
-      // lands (settings/document-updated). `refreshing` clears on that update
-      // or after a timeout, whichever comes first.
-      const [refreshing, setRefreshing] = useState(false)
-      const refreshTimer = useRef(null)
-      const profileStamp = (((view.section || {}).auth || {}).profile || {}).updatedAt || 0
+      // Ask the host to refetch balance + groups (or, while disconnected, to
+      // retry now). The host serves each newer refreshAt once; `refreshing`
+      // clears when the auth status it writes lands, or after a timeout.
       const requestRefresh = useCallback(() => {
         setRefreshing(true)
+        setRefreshError(null)
         clearTimeout(refreshTimer.current)
-        refreshTimer.current = setTimeout(() => setRefreshing(false), 15000)
+        refreshTimer.current = setTimeout(() => setRefreshing(false), REFRESH_SPIN_MS)
         api.settings.mutate(NS, [{ op: 'set', path: ['refreshAt'], value: Date.now() }])
-          .catch((error) => { setRefreshing(false); setNotice(msg(error)) })
+          .catch((error) => { setRefreshing(false); setRefreshError(msg(error)) })
       }, [api])
-      useEffect(() => { setRefreshing(false) }, [profileStamp])
+      const authKey = JSON.stringify(auth)
+      useEffect(() => { setRefreshing(false) }, [authKey])
       useEffect(() => () => clearTimeout(refreshTimer.current), [])
 
       // Opening the page with a balance older than 5 minutes refreshes once.
-      const autoRefreshed = useRef(false)
-      const authState = ((view.section || {}).auth || {}).state
+      const profile = auth.profile || {}
+      const profileStamp = profile.updatedAt || 0
       useEffect(() => {
-        if (autoRefreshed.current || view.status !== 'ready' || authState !== 'ok') return
+        if (autoRefreshed.current || view.status !== 'ready' || auth.state !== 'ok') return
         autoRefreshed.current = true
         if (Date.now() - profileStamp > 5 * 60_000) requestRefresh()
-      }, [view.status, authState, profileStamp, requestRefresh])
+      }, [view.status, auth.state, profileStamp, requestRefresh])
 
-      if (view.status === 'loading') {
-        return h('div', { className: 'pxa-section' },
-          h('div', { className: 'pxa-header' },
-            h('div', { className: 'pxa-header-top' },
-              h('h2', { className: 'pxa-title' }, t('title')),
-              h('div', { className: 'pxa-site-badge' }, h(GlobeIcon, null), 'api.ai-pixel.online'),
-            ),
-            h('p', { className: 'pxa-desc' }, t('subtitle')),
-          ),
-          h('div', { className: 'pxa-card' },
-            h('div', { className: 'pxa-desc' }, t('status.loading')),
-          ),
-        )
+      const retryLoad = () => {
+        setReloading(true)
+        void load().finally(() => setReloading(false))
       }
 
-      if (view.status === 'error') {
-        return h('div', { className: 'pxa-section' },
-          h('div', { className: 'pxa-header' },
-            h('div', { className: 'pxa-header-top' },
-              h('h2', { className: 'pxa-title' }, t('title')),
-              h('div', { className: 'pxa-site-badge' }, h(GlobeIcon, null), 'api.ai-pixel.online'),
-            ),
-            h('p', { className: 'pxa-desc' }, t('subtitle')),
-          ),
-          h('div', { className: 'pxa-card' },
-            h('div', { className: 'pxa-banner err' }, view.error),
-            h('div', { className: 'pxa-actions' },
-              h('button', { className: 'pxa-btn', onClick: () => void load() }, t('action.refresh')),
-            ),
-          ),
-        )
+      const signingIn = action === 'login' || configured(REFS.password) || (attempt !== null && attempt.kind === 'login')
+      const verifying = action === 'verify' || configured(REFS.otp) || (attempt !== null && attempt.kind === 'verify')
+      // Login card message: a failed page action, else what the host says
+      // (hidden while a new sign-in runs).
+      let message = notice ? { tone: 'err', text: notice } : null
+      if (message === null && phase === 'login' && !signingIn && auth.message) {
+        if (auth.state === 'error') {
+          const text = otpFailure === auth.message ? fillText(t, 'err.otpFailed', { reason: auth.message }) : auth.message
+          message = { tone: 'err', text }
+        } else if (auth.state === 'none') {
+          message = { tone: 'info', text: auth.message }
+        }
       }
-
-      const auth = authOf(view.section)
-      const username = (view.section && view.section.username) || ''
-
-      // 1. Form Card (Logged Out)
-      const formCard = h('div', { className: 'pxa-card' },
-        h('div', { className: 'pxa-card-head' },
-          h('div', { className: 'pxa-card-title' },
-            h(LockIcon, null),
-            t('card.loginTitle'),
-          ),
-        ),
-        h('div', { className: 'pxa-form' },
-          h('div', { className: 'pxa-field' },
-            h('label', { className: 'pxa-label' }, t('field.username')),
-            h('div', { className: 'pxa-input-wrap' },
-              h('input', {
-                className: 'pxa-input',
-                value: form.username,
-                placeholder: t('field.username.placeholder'),
-                autoComplete: 'username',
-                disabled: busy,
-                onChange: (e) => setForm((f) => ({ ...f, username: e.target.value })),
-                onKeyDown: (e) => { if (e.key === 'Enter' && !busy) login() },
-              }),
-            ),
-          ),
-          h('div', { className: 'pxa-field' },
-            h('label', { className: 'pxa-label' }, t('field.password')),
-            h('div', { className: 'pxa-input-wrap' },
-              h('input', {
-                className: 'pxa-input has-toggle',
-                type: showPassword ? 'text' : 'password',
-                value: form.password,
-                placeholder: t('field.password.placeholder'),
-                autoComplete: 'current-password',
-                disabled: busy,
-                onChange: (e) => setForm((f) => ({ ...f, password: e.target.value })),
-                onKeyDown: (e) => { if (e.key === 'Enter' && !busy) login() },
-              }),
-              h('button', {
-                type: 'button',
-                className: 'pxa-toggle-btn',
-                title: showPassword ? t('action.hidePassword') : t('action.showPassword'),
-                tabIndex: -1,
-                onClick: () => setShowPassword((v) => !v),
-              }, showPassword ? h(EyeOffIcon, null) : h(EyeIcon, null)),
-            ),
-          ),
-          h('div', { className: 'pxa-actions' },
-            h('button', {
-              className: 'pxa-btn primary',
-              disabled: busy,
-              onClick: login,
-            }, busy ? t('action.loggingIn') : t('action.login')),
-          ),
-        ),
-        h('div', { className: 'pxa-security-hint' },
-          h(ShieldIcon, null),
-          h('span', null, t('hint.session')),
-        ),
-      )
-
-      // 2. 2FA Challenge Card
-      const otpCard = h('div', { className: 'pxa-card' },
-        h('div', { className: 'pxa-card-head' },
-          h('div', { className: 'pxa-card-title' },
-            h(KeyIcon, null),
-            t('card.otpTitle'),
-          ),
-        ),
-        h('div', { className: 'pxa-banner warn' },
-          auth.message || t('status.2fa'),
-        ),
-        h('div', { className: 'pxa-form' },
-          h('div', { className: 'pxa-field' },
-            h('label', { className: 'pxa-label' }, t('field.otp')),
-            h('div', { className: 'pxa-input-wrap' },
-              h('input', {
-                className: 'pxa-input pxa-otp-input',
-                value: form.otp,
-                placeholder: t('field.otp.placeholder'),
-                inputMode: 'numeric',
-                autoComplete: 'one-time-code',
-                autoFocus: true,
-                disabled: busy,
-                onChange: (e) => setForm((f) => ({ ...f, otp: e.target.value })),
-                onKeyDown: (e) => { if (e.key === 'Enter' && !busy) verify() },
-              }),
-            ),
-          ),
-          h('div', { className: 'pxa-actions' },
-            h('button', {
-              className: 'pxa-btn primary',
-              disabled: busy,
-              onClick: verify,
-            }, busy ? t('action.verifying') : t('action.verify')),
-            h('button', {
-              className: 'pxa-btn',
-              disabled: busy,
-              onClick: cancelChallenge,
-            }, t('action.cancel')),
-          ),
-        ),
-      )
-
-      // 3. Logged in: identity card, balance card, context window card.
-      const fill = (key, vars) => Object.entries(vars).reduce(
-        (text, [k, v]) => text.split('{' + k + '}').join(String(v)), t(key))
-      const profile = auth.profile || {}
-      const displayName = profile.name || auth.user || username || '—'
-      const userInitial = displayName.charAt(0).toUpperCase()
       const groupCount = typeof auth.groupCount === 'number' && auth.groupCount > 0
         ? auth.groupCount
         : (auth.groups || []).length
       const modelCount = typeof auth.models === 'number' ? auth.models : -1
-      const idLine = [
-        profile.id ? 'ID ' + profile.id : '',
-        profile.group ? fill('ok.userGroup', { group: profile.group }) : '',
-      ].filter(Boolean).join(' · ')
-      const usageLine = profile.updatedAt
-        ? [
-          profile.used ? fill('ok.used', { used: profile.used }) : '',
-          fill('ok.requests', { count: Number(profile.requests || 0).toLocaleString() }),
-        ].filter(Boolean).join(' · ')
-        : ''
-      const updatedLine = refreshing
-        ? t('ok.updating')
-        : profile.updatedAt
-          ? fill('ok.updated', { time: new Date(profile.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) })
-          : ''
-      const updateCard = h(UpdateCard, { api, t, section: view.section, reload: load })
-      const statusCard = h(React.Fragment, null,
-        h('div', { className: 'pxa-card pxa-id-card' },
-          h('div', { className: 'pxa-avatar' }, userInitial),
-          h('div', { className: 'pxa-user-info' },
-            h('div', { className: 'pxa-user-name' }, displayName),
-            idLine ? h('div', { className: 'pxa-user-sub' }, idLine) : null,
-          ),
-          h('div', { className: 'pxa-id-side' },
-            h('div', { className: 'pxa-badge-success' },
-              h('span', { className: 'pxa-status-dot' }),
-              t('status.ok'),
-            ),
-            h('a', { className: 'pxa-link', href: SITE_URL + '/', target: '_blank', rel: 'noreferrer' },
-              t('action.openSite') + ' ↗'),
-          ),
-        ),
-        h('div', { className: 'pxa-card pxa-balance-card' },
-          h('div', { className: 'pxa-balance-row' },
-            h('span', { className: 'pxa-balance-label' }, t('ok.balance')),
-            h('span', { className: 'pxa-balance-value' + (refreshing ? ' dim' : '') },
-              profile.balance || t('ok.unknown')),
-          ),
-          h('div', { className: 'pxa-balance-foot' },
-            h('span', { className: 'pxa-balance-meta' }, [usageLine, updatedLine].filter(Boolean).join(' · ')),
-            h('div', { className: 'pxa-actions tight' },
-              h('button', {
-                className: 'pxa-btn',
-                disabled: busy || refreshing,
-                onClick: requestRefresh,
-              }, t('action.refresh')),
-              h('a', {
-                className: 'pxa-btn primary',
-                href: SITE_URL + '/wallet',
-                target: '_blank',
-                rel: 'noreferrer',
-              }, t('action.topup')),
-            ),
-          ),
-        ),
-        h(ContextCard, { api, t, section: view.section, reload: load }),
-        h(ReplayCard, { api, t, section: view.section, reload: load }),
-        updateCard,
-        h('div', { className: 'pxa-footer' },
-          h('span', null, groupCount > 0
-            ? (modelCount >= 0
-              ? fill('ok.mounted', { groups: groupCount, models: modelCount })
-              : fill('ok.mountedNoModels', { groups: groupCount }))
-            : ''),
-          h('button', { className: 'pxa-text-btn danger', disabled: busy, onClick: logout }, t('action.logout')),
-        ),
-      )
-
-      // Main container assembly
-      const elements = [
-        h('div', { key: 'hdr', className: 'pxa-header' },
-          h('div', { className: 'pxa-header-top' },
-            h('h2', { className: 'pxa-title' }, t('title')),
-            h('div', { className: 'pxa-site-badge' }, h(GlobeIcon, null), 'api.ai-pixel.online'),
-          ),
-          h('p', { className: 'pxa-desc' }, t('subtitle')),
-        ),
-      ]
-
-      if (notice) {
-        elements.push(h('div', { key: 'err-notice', className: 'pxa-banner err' }, notice))
+      let mounted = ''
+      if (groupCount > 0) {
+        mounted = modelCount >= 0
+          ? fillText(t, 'ok.mounted', { groups: groupCount, models: modelCount })
+          : fillText(t, 'ok.mountedNoModels', { groups: groupCount })
       }
 
-      if (auth.state === '2fa') {
-        elements.push(h(React.Fragment, { key: 'otp-card' }, otpCard))
-        elements.push(h(React.Fragment, { key: 'update-card' }, updateCard))
-      } else if (auth.state === 'ok') {
-        elements.push(h(React.Fragment, { key: 'status-card' }, statusCard))
-      } else {
-        if (auth.state === 'error' && auth.message) {
-          elements.push(h('div', { key: 'auth-err', className: 'pxa-banner err' }, auth.message))
-        } else if (auth.state === 'pending') {
-          elements.push(h('div', { key: 'auth-pending', className: 'pxa-banner info' }, t('status.pending')))
-        } else if (auth.message) {
-          elements.push(h('div', { key: 'auth-msg', className: 'pxa-banner info' }, auth.message))
+      const rowProps = { api, t, section: view.section, reload: load }
+      const skeleton = phase === 'loading' || phase === 'connecting'
+      const blocks = []
+      // Each block fades in on mount, 40 ms after the one above it.
+      const block = (key, el) => blocks.push(h('div', { key, className: 'pxa-enter', style: { '--pxa-i': blocks.length } }, el))
+      const bar = (width, height) => h('span', { className: 'pxa-skel', style: { width, height } })
+
+      if (skeleton) {
+        block('skeleton-identity', h('div', { className: 'pxa-card pxa-identity', 'aria-hidden': true },
+          h('div', { className: 'pxa-who' },
+            h('span', { className: 'pxa-skel circle' }),
+            h('div', { className: 'pxa-skel-lines' }, bar(96, 12), bar(160, 10)))))
+        block('skeleton-balance', h('div', { className: 'pxa-card pxa-balance', 'aria-hidden': true },
+          h('div', { className: 'pxa-line' }, bar(120, 14)),
+          h('div', { className: 'pxa-divider' }),
+          h('div', { className: 'pxa-line' }, bar(220, 10))))
+      } else if (phase === 'error') {
+        block('load-error', h(NoticeCard, {
+          tone: 'err',
+          text: fillText(t, 'load.failed', { reason: view.error }),
+          action: t('action.retry'),
+          busy: reloading,
+          onAction: retryLoad,
+        }))
+      } else if (phase === 'connected' || phase === 'interrupted') {
+        const connected = phase === 'connected'
+        block('identity', h(IdentityCard, {
+          t,
+          name: profile.name || auth.user || username,
+          detail: [profile.id ? 'ID ' + profile.id : '', profile.group].filter(Boolean).join(' · '),
+          connected,
+          pulse: connected && welcome,
+          onPulseEnd: () => setWelcome(false),
+        }))
+        if (connected) {
+          block('balance', h(BalanceCard, { t, profile, refreshing, error: refreshError, onRefresh: requestRefresh }))
+        } else {
+          block('retry', h(NoticeCard, {
+            tone: refreshError ? 'err' : 'warn',
+            text: refreshError || auth.message,
+            action: t('action.retryNow'),
+            busy: refreshing,
+            onAction: requestRefresh,
+          }))
         }
-        elements.push(h(React.Fragment, { key: 'login-card' }, formCard))
-        elements.push(h(React.Fragment, { key: 'update-card' }, updateCard))
+        block('settings', h('div', { className: 'pxa-card pxa-rows' },
+          h(ContextRow, rowProps), h(ReplayRow, rowProps), h(VersionRow, rowProps)))
+        block('footer', h(AccountFooter, { t, mounted, busy: action === 'logout', error: notice, onSignOut: logout }))
+      } else {
+        block('login', h(LoginCard, {
+          t,
+          step: phase === '2fa' ? 'otp' : 'password',
+          initialUsername: username,
+          user: auth.user || username,
+          message,
+          signingIn,
+          verifying,
+          cancelling: action === 'cancel',
+          failures,
+          onLogin: login,
+          onVerify: verify,
+          onBack: cancelChallenge,
+        }))
+        block('version', h('div', { className: 'pxa-card pxa-rows' }, h(VersionRow, rowProps)))
       }
 
-      return h('div', { className: 'pxa-section' }, elements)
+      return h('div', { className: 'pxa-section', 'aria-busy': skeleton },
+        skeleton ? h('span', { className: 'pxa-sr', role: 'status' }, t('status.loading')) : null,
+        blocks)
     }
 
     // ---------------------------------------------------------------------
