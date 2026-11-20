@@ -4,8 +4,11 @@
 // validation, save, restore defaults), the GPT replay switch, the plugin
 // version row (check, confirm, each state), sign-out confirmation, the login
 // card (field checks, progress read from the password credential, refusals,
-// the 2FA step's auto-submit and a refused code), and the view of a session
-// that is kept while the site cannot be reached.
+// the 2FA step's auto-submit, a refused code and 返回), the view of a session
+// that is kept while the site cannot be reached, the stale-balance refresh
+// per signed-in session, one-shot animations ending without animationend,
+// and the two-column model picker (ratio split, keys, screen-reader
+// attributes, busy trigger, effort chips, English copy).
 //   node test/check-client.mjs [out-file]
 // Exits 1 when a check fails. Layout, styling and motion still need a look in the app.
 import { readFileSync, writeFileSync } from 'node:fs'
@@ -36,6 +39,21 @@ function createRenderer() {
   let texts = []
   let visited = new Set()
   let ids = 0
+  // DOM stand-ins behind `ref`s, one per tree position: enough to focus,
+  // measure and scroll what a component rendered.
+  const hostNodes = new Map()
+  const attachRef = (ref, key) => {
+    if (!hostNodes.has(key)) {
+      hostNodes.set(key, {
+        focus() {},
+        scrollIntoView() {},
+        contains: () => false,
+        getBoundingClientRect: () => ({ top: 640, right: 1100, bottom: 668, left: 900, width: 200, height: 28 }),
+      })
+    }
+    if (typeof ref === 'function') ref(hostNodes.get(key))
+    else ref.current = hostNodes.get(key)
+  }
   const nodeFor = (key) => {
     visited.add(key)
     if (!nodes.has(key)) nodes.set(key, { hooks: [], deps: [], cleanups: [], pending: [] })
@@ -69,6 +87,7 @@ function createRenderer() {
       return
     }
     elements.push(el)
+    if (el.props.ref) attachRef(el.props.ref, at)
     walk(el.props.children, `${at}/${el.type}`, effects)
   }
   const dispatcher = {
@@ -161,15 +180,33 @@ const React = {
 }
 
 // --- run client.js ----------------------------------------------------------
+const source = readFileSync(join(here, '..', 'client.js'), 'utf8')
+// A timing constant of client.js, for checks that wait one out.
+const constant = (name) => Number(new RegExp(`const ${name} = (\\d+)`).exec(source)?.[1])
+// The give-ups on host requests (HOST_WAIT_MS, 30 s) do not run by themselves
+// here: a check runs the pending ones with giveUpWaits().
+const hostWaitMs = constant('HOST_WAIT_MS')
+const heldWaits = new Map()
+const giveUpWaits = () => {
+  const due = [...heldWaits.values()]
+  heldWaits.clear()
+  for (const fn of due) fn()
+}
 const loaders = []
 const sandbox = {
-  window: { __ModuleLoader__: { load: (definition) => loaders.push(definition) }, addEventListener() {}, removeEventListener() {} },
+  window: { __ModuleLoader__: { load: (definition) => loaders.push(definition) }, addEventListener() {}, removeEventListener() {}, innerWidth: 1280, innerHeight: 800 },
   document: { getElementById: () => null, createElement: () => ({ remove() {} }), head: { appendChild() {} }, addEventListener() {}, removeEventListener() {} },
-  queueMicrotask, setTimeout, clearTimeout, setInterval, clearInterval, console,
+  setTimeout: (fn, ms, ...args) => {
+    if (ms !== hostWaitMs) return setTimeout(fn, ms, ...args)
+    const handle = {}
+    heldWaits.set(handle, () => fn(...args))
+    return handle
+  },
+  clearTimeout: (handle) => { if (!heldWaits.delete(handle)) clearTimeout(handle) },
+  queueMicrotask, setInterval, clearInterval, console,
 }
 sandbox.globalThis = sandbox
 vm.createContext(sandbox)
-const source = readFileSync(join(here, '..', 'client.js'), 'utf8')
 vm.runInContext(source, sandbox, { filename: 'client.js' })
 check('client.js registers with the module loader', loaders.length === 1)
 const exports = loaders[0].factory((name) => {
@@ -182,7 +219,7 @@ const NS = 'pixel-api'
 const REFS = { password: 'PIXEL_API_PASSWORD', refresh: 'PIXEL_API_REFRESH', otp: 'PIXEL_API_2FA' }
 const RETRY_TEXT = '暂时连不上 PIXEL 主站，登录状态已保留，稍后自动重试'
 const authStatus = (fields) => ({
-  state: 'none', message: '', user: '', groups: [], groupCount: 0, models: -1, signOutAt: 0,
+  state: 'none', message: '', user: '', groups: [], groupCount: 0, models: -1, signOutAt: 0, cancelChallengeAt: 0,
   profile: { id: 0, name: '', group: '', balance: '', used: '', requests: 0, updatedAt: 0 },
   ...fields,
 })
@@ -230,19 +267,36 @@ const remote = {
     return () => listeners.set(name, (listeners.get(name) ?? []).filter((f) => f !== fn))
   },
 }
+// The session's model directory behind the picker: a snapshot the checks
+// rewrite, and every selection the picker sends.
+let directoryState = { status: 'ready', groups: [], current: null, pending: null, error: null, failures: [] }
+let selectResult = { ok: true }
+const selections = []
+const modelDirectory = {
+  store: { subscribe: () => () => {}, getSnapshot: () => directoryState },
+  load: async () => {},
+  select: async (selection) => { selections.push(selection); return selectResult },
+}
 const dicts = {}
 const registrations = []
+// Copy follows `lang`, as it follows the Harness language.
+let lang = 'zh'
+const slots = {
+  inject: (_name, fn) => fn(),
+  register: (options, component) => { registrations.push({ options, component }); return () => {} },
+}
 exports.apply({
   effect: (fn) => fn(),
   locale: {
     register: (ns, map) => { dicts[ns] = map; return () => {} },
-    bind: (ns) => (key) => dicts[ns]?.zh?.[key] ?? key,
+    bind: (ns) => (key) => dicts[ns]?.[lang]?.[key] ?? key,
   },
-  slots: {
-    inject: (_name, fn) => fn(),
-    register: (options, component) => { registrations.push({ options, component }); return () => {} },
-  },
-  inject: () => {},
+  slots,
+  inject: (_services, fn) => fn({
+    slots,
+    sessions: { subagentAddress: () => undefined },
+    modelDirectories: { directoryFor: () => modelDirectory },
+  }),
   remote,
 })
 const page = registrations.find((r) => r.options.name === 'settings.section')
@@ -574,6 +628,308 @@ check('password credential configured on open: 登录中…, fields locked, old 
   && field('password')?.props.disabled === true && !messageOpen())
 check('the stored username is filled in', field('username')?.props.value === 'alice')
 check('no render errors on a fresh page', renderer.errors.length === 0, renderer.errors)
+
+// --- 返回 from the 2FA step ------------------------------------------------------------------
+// The challenge lives in the host's memory: the page asks the host to end it
+// and follows the status the host writes back.
+log('Leaving the 2FA step')
+renderer = createRenderer()
+const challenge = { state: '2fa', message: '该账号启用了两步验证，请输入 TOTP 验证码', user: 'alice' }
+section = { username: 'alice', contextWindow: 272000, contextWindows: {}, auth: authStatus(challenge) }
+creds = { [REFS.password]: false, [REFS.refresh]: false, [REFS.otp]: false }
+await settle()
+check('a pending challenge opens on the code step', otpInput() !== undefined && button(t('action.back')) !== undefined)
+// 返回中: 返回, the code input and 验证并登录 all locked.
+const returning = () => button(t('action.back'))?.props.disabled === true && otpInput()?.props.disabled === true
+  && button(t('action.verify'))?.props.disabled === true
+const usable = () => button(t('action.back'))?.props.disabled === false && otpInput()?.props.disabled === false
+const beforeBack = wire.length
+await click(t('action.back'))
+const backCalls = wire.slice(beforeBack)
+const cancelAt = backCalls[0]?.ops?.[0]?.value
+check('返回 only raises cancelChallengeAt: no credential dropped, no status written by the page',
+  backCalls.length === 1 && backCalls[0].kind === 'mutate' && backCalls[0].ns === NS && backCalls[0].ops.length === 1
+  && backCalls[0].ops[0].op === 'set' && backCalls[0].ops[0].path.join('.') === 'cancelChallengeAt'
+  && Number.isFinite(cancelAt), backCalls)
+check('until the host ends the challenge, the code step stays', otpInput() !== undefined && field('password') === undefined)
+// The settings are read again; the host has not answered yet.
+await host()
+check('返回中 until the host answers: 返回, the code input and 验证并登录 stay disabled',
+  otpInput() !== undefined && returning(), { back: button(t('action.back'))?.props.disabled, otp: otpInput()?.props.disabled })
+// The host drops the challenge and both credentials, keeps the username and
+// writes none, stamping the request it served; its next pass writes 请输入密码.
+await host({ auth: { state: 'none', message: '', user: '', cancelChallengeAt: cancelAt } })
+check('the host\'s none brings back the password step with the username filled in, no error shown',
+  field('password') !== undefined && otpInput() === undefined && field('username')?.props.value === 'alice' && !messageOpen())
+await host({ auth: { state: 'none', message: '请输入密码', user: 'alice', cancelChallengeAt: cancelAt } })
+check('the next pass\'s 请输入密码 is a hint on a usable form',
+  field('password')?.props.disabled === false && button(t('action.login'))?.props.disabled === false && renderer.text.includes('请输入密码'))
+// Signing in again meets a new challenge, which carries the served 返回.
+await type(field('password'), 'right-secret')
+await submit()
+await host({ creds: { [REFS.password]: false }, auth: { ...challenge, cancelChallengeAt: cancelAt } })
+check('a new challenge after 返回 starts usable, nothing left in progress', otpInput() !== undefined && usable())
+// A 返回 the host never answers.
+await click(t('action.back'))
+const lockedAfterClick = returning()
+giveUpWaits()
+await settle()
+check('a 返回 the host never answers is given up after 30 s: 返回 and the code input usable again',
+  hostWaitMs === 30000 && lockedAfterClick && otpInput() !== undefined && usable(), { hostWaitMs, lockedAfterClick })
+check('no render errors leaving the 2FA step', renderer.errors.length === 0, renderer.errors)
+
+// --- the stale-balance refresh, once per signed-in session -----------------------------------
+log('Signing out and back in on one page')
+renderer = createRenderer()
+const staleProfile = { ...OK_FIELDS.profile, updatedAt: Date.now() - 10 * 60_000 }
+section = { username: 'alice', contextWindow: 272000, contextWindows: {}, auth: authStatus({ ...OK_FIELDS, user: 'alice', profile: staleProfile }) }
+creds = { [REFS.password]: false, [REFS.refresh]: true, [REFS.otp]: false }
+const refreshWrites = () => mutations.filter((m) => m.ops.some((o) => o.path[0] === 'refreshAt')).length
+const refreshesBefore = refreshWrites()
+await settle()
+check('opening the page with a balance older than 5 minutes refreshes it once', refreshWrites() === refreshesBefore + 1, refreshWrites() - refreshesBefore)
+await click(t('action.logout'))
+await click(t('action.logout'))
+check('signed out on this page: the login card', field('password') !== undefined && button(t('action.logout')) === undefined)
+await type(field('username'), 'alice')
+await type(field('password'), 'right-secret')
+await submit()
+await host({ creds: { [REFS.password]: false, [REFS.refresh]: true }, auth: { ...OK_FIELDS, user: 'alice', profile: staleProfile } })
+check('signing back in on the same page refreshes an old balance again',
+  renderer.text.includes(t('status.ok')) && refreshWrites() === refreshesBefore + 2, refreshWrites() - refreshesBefore)
+
+// --- one-shot animations without animationend ------------------------------------------------
+// Under prefers-reduced-motion the shake and the pulse are `animation: none`,
+// so animationend never fires — as in this vm, where only endShake() fires it.
+log('Shake and pulse without animationend')
+const shakeMs = constant('SHAKE_MS')
+const pulseMs = constant('PULSE_DELAY_MS') + constant('PULSE_MS')
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const pulsing = () => find((el) => hasClass(el, 'pxa-dot') && hasClass(el, 'pulse')) !== undefined
+const editor = () => find((el) => hasClass(el, 'pxa-edit'))
+renderer = createRenderer()
+section = { username: '', contextWindow: 272000, contextWindows: {}, auth: authStatus({}) }
+creds = { [REFS.password]: false, [REFS.refresh]: false, [REFS.otp]: false }
+await settle()
+await submit()
+check('an empty sign-in shakes the card', hasClass(loginCard(), 'pxa-shake'))
+await sleep(shakeMs + 100)
+await settle()
+check('the card stops shaking after the shake\'s length, with no animationend',
+  Number.isFinite(shakeMs) && !hasClass(loginCard(), 'pxa-shake'), shakeMs)
+await type(field('username'), 'alice')
+await type(field('password'), 'right-secret')
+await submit()
+await host({ creds: { [REFS.password]: false, [REFS.refresh]: true }, auth: { ...OK_FIELDS, user: 'alice' } })
+check('a sign-in from the page pulses the status dot', pulsing())
+await sleep(pulseMs + 100)
+await settle()
+check('the pulse ends after its delay and length, with no animationend', Number.isFinite(pulseMs) && !pulsing(), pulseMs)
+await click(t('ctx.edit'))
+await type(input(), '1')
+await click(t('ctx.save'))
+check('a refused context window shakes the editor', hasClass(editor(), 'pxa-shake'))
+await sleep(shakeMs + 100)
+await settle()
+check('the editor stops shaking by itself too', !hasClass(editor(), 'pxa-shake'))
+check('no render errors without animationend', renderer.errors.length === 0, renderer.errors)
+
+// --- the two-column model picker ---------------------------------------------------------------
+log('Model picker')
+const picker = registrations.find((r) => r.options.name === 'conversation.input.model')
+check('the model picker takes the conversation.input.model seat', picker !== undefined)
+const pickerProps = picker.options.inject('session-1')
+const settlePicker = () => renderer.settle(picker.component, pickerProps)
+const EFFORTS = [{ id: 'low', name: 'low' }, { id: 'medium', name: 'medium' }, { id: 'high', name: 'high' }]
+const model = (id, extra) => ({ id, name: id, ...extra })
+// The first host element under `el` that matches (components are opaque).
+const inside = (el, pred) => {
+  for (const kid of [el?.props.children].flat(Infinity)) {
+    if (!kid || !kid.__el || typeof kid.type === 'function') continue
+    if (pred(kid)) return kid
+    const hit = inside(kid, pred)
+    if (hit) return hit
+  }
+  return undefined
+}
+// Host elements from `from` down to `target`.
+const pathTo = (from, target) => {
+  if (from === target) return [from]
+  for (const kid of [from?.props.children].flat(Infinity)) {
+    if (!kid || !kid.__el || typeof kid.type === 'function') continue
+    const rest = pathTo(kid, target)
+    if (rest) return [from, ...rest]
+  }
+  return null
+}
+const trigger = () => find((el) => hasClass(el, 'pxm-trigger'))
+const menuShown = () => find((el) => hasClass(el, 'pxm-menu')) !== undefined
+const openPicker = async () => {
+  if (menuShown()) return
+  await trigger().props.onClick()
+  await settlePicker()
+}
+const searchBox = () => find((el) => el.type === 'input' && hasClass(el, 'pxm-search'))
+const modelList = () => find((el) => hasClass(el, 'pxm-right'))
+const modelRows = () => buttonsIn(modelList())
+const highlighted = () => modelRows().find((el) => hasClass(el, 'hl'))
+const activeOption = () => searchBox()?.props['aria-activedescendant']
+const groupRows = () => buttonsIn(find((el) => hasClass(el, 'pxm-left'))).map((row) => ({
+  row,
+  name: textOf(inside(row, (n) => hasClass(n, 'pxm-name'))?.props.children),
+  ratio: textOf(inside(row, (n) => hasClass(n, 'pxm-ratio'))?.props.children),
+}))
+const groupButton = (name) => groupRows().find((g) => g.name === name)?.row
+const chip = (label) => find((el) => el.type === 'button' && hasClass(el, 'pxm-chip') && textOf(el.props.children) === label)
+// React bubbles a synthetic event up the component tree, through the menu's
+// portal too: a key pressed in the search box reaches every onKeyDown between
+// it and the picker root.
+const press = async (key, extra = {}) => {
+  const event = {
+    key, altKey: false, ...extra, nativeEvent: { isComposing: false }, stopped: false,
+    preventDefault() {}, stopPropagation() { this.stopped = true },
+  }
+  for (const el of pathTo(find((n) => hasClass(n, 'pxm-root')), searchBox()).reverse()) {
+    if (event.stopped) break
+    if (typeof el.props.onKeyDown === 'function') el.props.onKeyDown(event)
+  }
+  await settlePicker()
+}
+renderer = createRenderer()
+directoryState = {
+  status: 'ready',
+  groups: [
+    { id: 'pixel/main', name: '主分组 ×1', models: [model('gpt-5', { reasoning: { defaultEffort: 'medium', efforts: EFFORTS } }), model('gpt-5-mini')] },
+    { id: 'pixel/room-7', name: 'Powerplant ×2 Boost', models: [model('gpt-5')] },
+    { id: 'pixel/room-8', name: 'Night ×3 Shift ×0.5', models: [model('gpt-5')] },
+  ],
+  current: { provider: 'pixel/main', model: 'gpt-5', reasoningEffort: 'medium' },
+  pending: null,
+  error: null,
+  failures: [],
+}
+await settlePicker()
+check('the trigger shows the current model and effort, menu closed',
+  textOf(trigger()?.props.children).includes('gpt-5') && textOf(trigger()?.props.children).includes('medium') && !menuShown())
+await openPicker()
+check('the trigger opens the menu', menuShown() && searchBox() !== undefined)
+check('a room name containing " ×": no ratio after it keeps the whole name, a ratio after it splits at the last mark',
+  groupRows().some((g) => g.name === 'Powerplant ×2 Boost' && g.ratio === '')
+  && groupRows().some((g) => g.name === 'Night ×3 Shift' && g.ratio === '×0.5')
+  && groupRows().some((g) => g.name === '主分组' && g.ratio === '×1'), groupRows().map(({ name, ratio }) => ({ name, ratio })))
+check('the search box is a searchbox on the model list, its active option the highlighted row',
+  searchBox()?.props.role === 'searchbox' && typeof modelList()?.props.id === 'string'
+  && searchBox().props['aria-controls'] === modelList().props.id
+  && typeof highlighted()?.props.id === 'string' && activeOption() === highlighted().props.id,
+  { role: searchBox()?.props.role, controls: searchBox()?.props['aria-controls'], list: modelList()?.props.id, active: activeOption(), hl: highlighted()?.props.id })
+const firstOption = activeOption()
+await press('ArrowDown')
+check('↓ moves the highlight one row, and the active option with it',
+  highlighted() === modelRows()[1] && typeof activeOption() === 'string' && activeOption() === modelRows()[1].props.id && activeOption() !== firstOption)
+const beforeEnter = selections.length
+await press('Enter')
+check('Enter in the search box chooses the highlighted model once',
+  selections.length === beforeEnter + 1 && selections.at(-1)?.model === 'gpt-5-mini', selections.slice(beforeEnter))
+check('a switch that lands closes the menu', !menuShown())
+directoryState = { ...directoryState, pending: { provider: 'pixel/main', model: 'gpt-5-mini' } }
+await settlePicker()
+const spinning = () => find((el) => hasClass(el, 'pxm-busy')) !== undefined
+const chevron = () => find((el) => hasClass(el, 'pxm-chevron')) !== undefined
+check('while a switch runs the trigger is busy: a spinner in place of the chevron',
+  trigger()?.props['aria-busy'] === true && spinning() && !chevron(), trigger()?.props['aria-busy'])
+directoryState = { ...directoryState, pending: null }
+await settlePicker()
+check('once it is done the chevron is back', trigger()?.props['aria-busy'] === false && !spinning() && chevron())
+await openPicker()
+const optionBefore = activeOption()
+await press('ArrowRight', { altKey: true })
+check('Alt+→ switches group and names that group\'s first row as the active option',
+  typeof activeOption() === 'string' && activeOption() !== optionBefore && activeOption() === highlighted()?.props.id
+  && textOf(find((el) => hasClass(el, 'pxm-heading') && textOf(el.props.children).startsWith('Powerplant'))?.props.children) !== '')
+const beforeChip = selections.length
+await chip('medium')?.props.onClick()
+await settlePicker()
+check('picking the effort already in use closes the menu without a switch, like picking the current model',
+  !menuShown() && selections.length === beforeChip, { open: menuShown(), sent: selections.slice(beforeChip) })
+await openPicker()
+await chip('high')?.props.onClick()
+await settlePicker()
+check('picking another effort switches to it',
+  selections.length === beforeChip + 1 && selections.at(-1)?.model === 'gpt-5' && selections.at(-1)?.reasoningEffort === 'high', selections.slice(beforeChip))
+check('no render errors in the picker', renderer.errors.length === 0, renderer.errors)
+
+// --- the picker in English ---------------------------------------------------------------------
+// Every state that shows copy, rendered with the Harness set to English.
+log('Model picker in English')
+// U+3000–303F CJK punctuation, U+3040–30FF kana, U+3400–4DBF / U+4E00–9FFF /
+// U+F900–FAFF ideographs, U+FF00–FFEF full-width forms (：，（）).
+const CJK =/[　-〿぀-ヿ㐀-䶿一-鿿豈-﫿＀-￯]/
+const shownCopy = []
+const capture = () => shownCopy.push(renderer.text,
+  ...renderer.elements.flatMap((el) => ['title', 'placeholder', 'aria-label'].map((k) => el.props[k]).filter((v) => typeof v === 'string')))
+lang = 'en'
+renderer = createRenderer()
+// Loading, nothing chosen yet; then loaded with no models.
+directoryState = { status: 'loading', groups: [], current: null, pending: null, error: null, failures: [] }
+await settlePicker()
+capture()
+await openPicker()
+capture()
+directoryState = { ...directoryState, status: 'ready' }
+await settlePicker()
+capture()
+await trigger().props.onClick()
+await settlePicker()
+capture()
+// The account group, ratios (auto too), a switch running, a catalog error and a failed group.
+directoryState = {
+  status: 'ready',
+  groups: [
+    { id: 'deepseek-account', name: 'DeepSeek', models: [model('deepseek-v4')] },
+    { id: 'pixel/main', name: 'Main room ×1', models: [model('gpt-5', { reasoning: { efforts: EFFORTS } }), model('gpt-5-mini')] },
+    { id: 'pixel/auto', name: 'Auto pick ×自动', models: [model('gpt-5')] },
+    { id: 'pixel/empty', name: 'Empty room ×0.5', models: [] },
+  ],
+  current: { provider: 'pixel/main', model: 'gpt-5' },
+  pending: { provider: 'pixel/main', model: 'gpt-5-mini' },
+  error: 'catalog down',
+  failures: [{ id: 'pixel/broken', name: 'Broken room ×2', message: 'HTTP 502' }],
+}
+await settlePicker()
+await openPicker()
+capture()
+// A group with no models; a search with no hits.
+await groupButton('Empty room')?.props.onClick()
+await settlePicker()
+capture()
+await searchBox().props.onChange({ target: { value: 'zzz' } })
+await settlePicker()
+capture()
+await searchBox().props.onChange({ target: { value: '' } })
+// Switches the session refuses.
+directoryState = { ...directoryState, pending: null }
+await settlePicker()
+await groupButton('Main room')?.props.onClick()
+await settlePicker()
+for (const result of [
+  { ok: false, error: { code: 'session/writer-held', message: 'held' } },
+  { ok: false, error: { code: 'model/failed', message: 'boom' } },
+  { ok: false, error: { code: 'model/failed' } },
+]) {
+  selectResult = result
+  await modelRows().find((el) => textOf(el.props.children) === 'gpt-5-mini')?.props.onClick()
+  await settlePicker()
+  capture()
+}
+selectResult = { ok: true }
+lang = 'zh'
+const englishCopy = shownCopy.join('\n')
+check('English UI: the picker shows no Chinese', !CJK.test(englishCopy), englishCopy.split('\n').filter((l) => CJK.test(l)))
+const pickerKeys = Object.keys(en).filter((k) => k.startsWith('picker.'))
+const notShown = [...pickerKeys, 'action.retry']
+  .filter((k) => !en[k].split(/\{[^}]+\}/).filter(Boolean).every((part) => englishCopy.includes(part)))
+check('English UI: every picker string shows, in English', pickerKeys.length > 0 && notShown.length === 0, notShown)
+check('no render errors in the English picker', renderer.errors.length === 0, renderer.errors)
 
 log(failures === 0 ? 'ALL OK' : `${failures} FAILED`)
 if (process.argv[2]) writeFileSync(process.argv[2], lines.join('\n'))

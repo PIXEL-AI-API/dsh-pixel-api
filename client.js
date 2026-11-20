@@ -41,8 +41,16 @@ window.__ModuleLoader__.load({
     const SLOW_SIGN_IN_MS = 12000
     // Refresh / retry spinners stop on the next auth status or after this.
     const REFRESH_SPIN_MS = 15000
+    // A request the host serves once (检查更新, 更新, 2FA 返回) is re-read this
+    // often while it waits, and given up after HOST_WAIT_MS.
+    const HOST_POLL_MS = 2000
+    const HOST_WAIT_MS = 30000
     // 「已保存」: 240 ms in, 2 s shown, 240 ms out.
     const SAVED_NOTICE_MS = 2240
+    // The field-error shake, and the status dot's pulse after a sign-in.
+    const SHAKE_MS = 320
+    const PULSE_MS = 900
+    const PULSE_DELAY_MS = 240
     const OTP_LENGTH = 6
 
     const zh = {
@@ -120,6 +128,32 @@ window.__ModuleLoader__.load({
       'upd.apply': '更新到 v{version}',
       'upd.applying': '更新中…',
       'upd.confirm': '确认更新',
+      'picker.account': 'DeepSeek 账号',
+      'picker.loading': '正在加载模型…',
+      'picker.choose': '请选择模型',
+      'picker.title': '选择模型',
+      'picker.search': '搜索模型…（↑↓ 选择，Alt+←→ 切换分组，Enter 确认）',
+      'picker.groups': '模型分组',
+      'picker.models': '模型',
+      'picker.refreshing': '正在刷新模型列表…',
+      'picker.noMatch': '没有匹配的分组',
+      'picker.empty': '暂无可用模型',
+      'picker.groupEmpty': '该分组暂无模型',
+      'picker.currentGroup': '当前模型所在分组',
+      'picker.groupId': 'ID: {id}',
+      'picker.tip.id': 'ID：{id}',
+      'picker.tip.ratio': '倍率：×{ratio}',
+      'picker.head.id': 'ID {id}',
+      'picker.head.ratio': '倍率 ×{ratio}',
+      'picker.ratio.auto': '自动',
+      'picker.switching': '切换中…',
+      'picker.effort': '推理等级',
+      'picker.defaultEffort': 'Default',
+      'picker.catalogFailed': '模型目录加载失败：{reason}',
+      'picker.groupFailed': '{group} 加载失败：{reason}',
+      'picker.writerHeld': '当前会话已被其他 DSH 实例占用，请退出其他实例后重试',
+      'picker.switchFailed': '切换失败：{reason}',
+      'picker.unknownError': '未知错误',
     }
 
     const en = {
@@ -197,6 +231,32 @@ window.__ModuleLoader__.load({
       'upd.apply': 'Update to v{version}',
       'upd.applying': 'Updating…',
       'upd.confirm': 'Confirm update',
+      'picker.account': 'DeepSeek Account',
+      'picker.loading': 'Loading models…',
+      'picker.choose': 'Select model',
+      'picker.title': 'Select model',
+      'picker.search': 'Search models… (↑↓ to select, Alt+←→ to switch groups, Enter to confirm)',
+      'picker.groups': 'Model groups',
+      'picker.models': 'Models',
+      'picker.refreshing': 'Refreshing model list…',
+      'picker.noMatch': 'No matching groups',
+      'picker.empty': 'No models available',
+      'picker.groupEmpty': 'No models in this group',
+      'picker.currentGroup': 'Group of the current model',
+      'picker.groupId': 'ID: {id}',
+      'picker.tip.id': 'ID: {id}',
+      'picker.tip.ratio': 'Ratio: ×{ratio}',
+      'picker.head.id': 'ID {id}',
+      'picker.head.ratio': 'Ratio ×{ratio}',
+      'picker.ratio.auto': 'auto',
+      'picker.switching': 'Switching…',
+      'picker.effort': 'Reasoning effort',
+      'picker.defaultEffort': 'Default',
+      'picker.catalogFailed': 'The model catalog failed to load: {reason}',
+      'picker.groupFailed': '{group} failed to load: {reason}',
+      'picker.writerHeld': 'Another DSH instance is using this session; quit it and try again',
+      'picker.switchFailed': 'Switching failed: {reason}',
+      'picker.unknownError': 'unknown error',
     }
 
     // Inline icons: 24-unit strokes in currentColor, hidden from assistive tech.
@@ -304,7 +364,7 @@ window.__ModuleLoader__.load({
           background: var(--dsw-alias-state-success-primary);
         }
         .pxa-dot.warn { background: var(--dsw-alias-state-warn-primary); }
-        .pxa-dot.pulse { animation: pxa-pulse 900ms var(--pxa-ease) var(--pxa-slow) both; }
+        .pxa-dot.pulse { animation: pxa-pulse ${PULSE_MS}ms var(--pxa-ease) ${PULSE_DELAY_MS}ms both; }
         .pxa-site-link {
           flex: none;
           display: inline-flex;
@@ -692,7 +752,7 @@ window.__ModuleLoader__.load({
         .pxa-otp-actions .pxa-btn.block { width: 240px; }
 
         .pxa-spin { flex: none; animation: pxa-rotate 0.8s linear infinite; }
-        .pxa-shake { animation: pxa-shake 320ms var(--pxa-ease); }
+        .pxa-shake { animation: pxa-shake ${SHAKE_MS}ms var(--pxa-ease); }
 
         @keyframes pxa-in { from { opacity: 0; transform: translateY(6px); } }
         @keyframes pxa-fade { from { opacity: 0; } }
@@ -811,6 +871,21 @@ window.__ModuleLoader__.load({
         h('div', { className: 'pxa-expand-inner' }, shown.current))
     }
 
+    // A flag that plays a one-shot animation (a shake, the status-dot pulse)
+    // while it is up. The element's animationend drops it, and so does a timer
+    // of the animation's length: under prefers-reduced-motion the animation is
+    // `none` and animationend never fires, nor does it for a run cut short
+    // when the element loses its class.
+    function useOneShot(ms) {
+      const [on, setOn] = useState(false)
+      useEffect(() => {
+        if (!on) return undefined
+        const timer = setTimeout(() => setOn(false), ms)
+        return () => clearTimeout(timer)
+      }, [on, ms])
+      return [on, setOn]
+    }
+
     // A settings row: title and one line of description on the left, the
     // control on the right, optional folding content (children) below.
     function SettingRow(props) {
@@ -839,7 +914,7 @@ window.__ModuleLoader__.load({
       const [error, setError] = useState(null)
       // When the last save landed (0: no 「已保存」 on screen).
       const [savedAt, setSavedAt] = useState(0)
-      const [shaking, setShaking] = useState(false)
+      const [shaking, setShaking] = useOneShot(SHAKE_MS)
       const id = useId()
 
       // Follow the stored value until the user edits: a host status write
@@ -1036,8 +1111,8 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (!pending) return undefined
         // Poll as well, in case no settings/document-updated event reaches this page.
-        const poll = setInterval(() => { if (typeof reload === 'function') void reload() }, 2000)
-        const giveUp = setTimeout(() => setSent(null), 30000)
+        const poll = setInterval(() => { if (typeof reload === 'function') void reload() }, HOST_POLL_MS)
+        const giveUp = setTimeout(() => setSent(null), HOST_WAIT_MS)
         return () => { clearInterval(poll); clearTimeout(giveUp) }
       }, [pending, reload])
       const checking = state === 'checking' || (pending && sent.kind === 'check')
@@ -1203,7 +1278,7 @@ window.__ModuleLoader__.load({
       const [form, setForm] = useState(() => ({ username: initialUsername, password: '', otp: '' }))
       const [missing, setMissing] = useState({ username: false, password: false })
       const [showPassword, setShowPassword] = useState(false)
-      const [shaking, setShaking] = useState(false)
+      const [shaking, setShaking] = useOneShot(SHAKE_MS)
       const [slow, setSlow] = useState(false)
       // The step on screen, and how the latest step change slides in.
       const [shownStep, setShownStep] = useState(step)
@@ -1301,8 +1376,13 @@ window.__ModuleLoader__.load({
                   disabled: verifying || cancelling || form.otp.length < OTP_LENGTH,
                   'aria-busy': verifying,
                 }, verifying ? h(Spinner) : null, verifying ? t('action.verifying') : t('action.verify')),
-                h('button', { type: 'button', className: 'pxa-text-btn md', disabled: verifying || cancelling, onClick: back },
-                  t('action.back'))))))
+                h('button', {
+                  type: 'button',
+                  className: 'pxa-text-btn md',
+                  disabled: verifying || cancelling,
+                  'aria-busy': cancelling,
+                  onClick: back,
+                }, t('action.back'))))))
       } else {
         content = h('div', { key: 'password', className: stepClass },
           head(t('login.title'), fillText(t, 'login.subtitle', { site: SITE_HOST })),
@@ -1374,12 +1454,14 @@ window.__ModuleLoader__.load({
       // Page action in flight (login | verify | cancel | logout) and its wire failure.
       const [action, setAction] = useState(null)
       const [notice, setNotice] = useState(null)
+      // The cancelChallengeAt this page's 返回 wrote (0: none); see `returning`.
+      const [cancelSent, setCancelSent] = useState(0)
       // A sign-in submitted here and the auth status it started from:
       // { kind: 'login' | 'verify', state, message }. See the outcome effect.
       const [attempt, setAttempt] = useState(null)
       const [failures, setFailures] = useState(0)
       // A sign-in from this page just connected: the status dot pulses once.
-      const [welcome, setWelcome] = useState(false)
+      const [welcome, setWelcome] = useOneShot(PULSE_DELAY_MS + PULSE_MS)
       // Host reason for a refused 2FA code (the challenge ended in an error).
       const [otpFailure, setOtpFailure] = useState(null)
       const [reloading, setReloading] = useState(false)
@@ -1446,6 +1528,19 @@ window.__ModuleLoader__.load({
         if (seenPhase === '2fa' && phase === 'login' && auth.state === 'error') setOtpFailure(auth.message)
       }
 
+      // 返回 stays in progress — 返回, the code input and 验证并登录 locked —
+      // while the page is still on the 2FA step and the host has not served
+      // that request (it stamps the served value into auth.cancelChallengeAt).
+      // Given up after HOST_WAIT_MS, as a VersionRow request is.
+      const returning = phase === '2fa' && cancelSent > (Number(auth.cancelChallengeAt) || 0)
+      useEffect(() => {
+        if (!returning) return undefined
+        // Poll as well, in case no settings/document-updated event reaches this page.
+        const poll = setInterval(() => { void load() }, HOST_POLL_MS)
+        const giveUp = setTimeout(() => setCancelSent(0), HOST_WAIT_MS)
+        return () => { clearInterval(poll); clearTimeout(giveUp) }
+      }, [returning, load])
+
       // Outcome of a sign-in this page submitted, read once the host has
       // consumed its credential. The host skips writing a status equal to
       // the current one, so a repeated refusal shows up only as the
@@ -1497,12 +1592,16 @@ window.__ModuleLoader__.load({
         await load()
       })
 
+      // 返回 from the 2FA step. The challenge lives in the host's memory, so
+      // only the host can end it: a newer cancelChallengeAt has it drop the
+      // challenge, delete the 2FA code and password credentials and write
+      // auth `none`, keeping the username. The page writes nothing else — a
+      // status written here would be overwritten with 2fa while the challenge
+      // stands — and stays 返回中 (`returning`) until that `none` lands.
       const cancelChallenge = () => run('cancel', async () => {
-        await api.credentials.unset(REFS.otp)
-        await api.credentials.unset(REFS.password)
-        await api.settings.mutate(NS, [
-          { op: 'set', path: ['auth'], value: { state: 'none', message: '', user: '', groups: [], models: -1 } },
-        ])
+        const at = Date.now()
+        await api.settings.mutate(NS, [{ op: 'set', path: ['cancelChallengeAt'], value: at }])
+        setCancelSent(at)
       })
 
       // Sign-out order matters: raise signOutAt FIRST, because the host must
@@ -1535,14 +1634,21 @@ window.__ModuleLoader__.load({
       useEffect(() => { setRefreshing(false) }, [authKey])
       useEffect(() => () => clearTimeout(refreshTimer.current), [])
 
-      // Opening the page with a balance older than 5 minutes refreshes once.
+      // A balance older than 5 minutes refreshes once per signed-in session:
+      // once when the page opens connected, and once more after signing out
+      // and back in on the same page (losing the session re-arms it).
       const profile = auth.profile || {}
       const profileStamp = profile.updatedAt || 0
       useEffect(() => {
-        if (autoRefreshed.current || view.status !== 'ready' || auth.state !== 'ok') return
+        if (view.status !== 'ready') return
+        if (!session) {
+          autoRefreshed.current = false
+          return
+        }
+        if (autoRefreshed.current || auth.state !== 'ok') return
         autoRefreshed.current = true
         if (Date.now() - profileStamp > 5 * 60_000) requestRefresh()
-      }, [view.status, auth.state, profileStamp, requestRefresh])
+      }, [view.status, session, auth.state, profileStamp, requestRefresh])
 
       const retryLoad = () => {
         setReloading(true)
@@ -1630,7 +1736,7 @@ window.__ModuleLoader__.load({
           message,
           signingIn,
           verifying,
-          cancelling: action === 'cancel',
+          cancelling: action === 'cancel' || returning,
           failures,
           onLogin: login,
           onVerify: verify,
@@ -1649,13 +1755,19 @@ window.__ModuleLoader__.load({
     // ---------------------------------------------------------------------
 
     const RATIO_MARK = ' ×'
+    // index.js formatRatio writes the auto group's ratio as this word.
+    const RATIO_AUTO = '自动'
     const MS_STYLE_ID = PLUGIN_ID + '/model-split.css'
 
-    // Host route names carry the ratio as `名称 ×0.5` (index.js formatRatio).
+    // Host route names end in the ratio, `名称 ×0.5` or `名称 ×自动`, when the
+    // site gives one (index.js formatRatio), and are the bare name otherwise.
+    // A room name may itself contain ` ×`, so split at the last mark and only
+    // when a ratio follows it.
     function splitRatio(name) {
       const at = name.lastIndexOf(RATIO_MARK)
-      if (at <= 0) return { name, ratio: '' }
-      return { name: name.slice(0, at), ratio: name.slice(at + RATIO_MARK.length) }
+      const ratio = at > 0 ? name.slice(at + RATIO_MARK.length) : ''
+      if (ratio !== RATIO_AUTO && !/^\d+(?:\.\d+)?$/.test(ratio)) return { name, ratio: '' }
+      return { name: name.slice(0, at), ratio }
     }
 
     function orderProviders(groups) {
@@ -1709,6 +1821,7 @@ window.__ModuleLoader__.load({
         .pxm-chevron { flex: 0 0 auto; width: 12px; height: 12px; color: var(--dsw-alias-label-caption);
           transition: transform 120ms ease; }
         .pxm-chevron.open { transform: rotate(180deg); }
+        .pxm-busy { flex: 0 0 auto; display: inline-flex; color: var(--dsw-alias-label-caption); }
 
         .pxm-menu {
           position: fixed; z-index: 1100; box-sizing: border-box;
@@ -1790,7 +1903,8 @@ window.__ModuleLoader__.load({
       h('polyline', { points: '20 6 9 17 4 12' }))
 
     function SplitModelSelect(props) {
-      const { locked, available, directory, load, select } = props
+      // `tp` is the page's copy function, injected by apply below.
+      const { locked, available, directory, load, select, tp: t } = props
       const useSyncExternalStore = React.useSyncExternalStore
       const state = useSyncExternalStore((fn) => directory.subscribe(fn), () => directory.getSnapshot())
       const [open, setOpen] = useState(false)
@@ -1804,14 +1918,16 @@ window.__ModuleLoader__.load({
       const menuRef = useRef(null)
       const searchRef = useRef(null)
       const rowRefs = useRef([])
+      const id = useId()
 
+      const groupName = (g) => (g.id === 'deepseek-account' ? t('picker.account') : String(g.name || g.id))
+      const ratioText = (ratio) => (ratio === RATIO_AUTO ? t('picker.ratio.auto') : ratio)
       const groups = React.useMemo(() => orderProviders(state.groups || []).map((g) => {
-        const label = g.id === 'deepseek-account' ? 'DeepSeek 账号' : String(g.name || g.id)
-        const parts = splitRatio(label)
+        const parts = splitRatio(groupName(g))
         // PIXEL routes are `pixel/<site group key>`; the key is the group ID.
         const key = String(g.id).startsWith('pixel/') ? String(g.id).slice(6) : ''
         return { id: g.id, key, models: g.models || [], name: parts.name, ratio: parts.ratio }
-      }), [state.groups])
+      }), [state.groups, t])
 
       const current = state.current
       const currentGroup = current ? groups.find((g) => g.id === current.provider) : undefined
@@ -1819,7 +1935,7 @@ window.__ModuleLoader__.load({
       const reasoning = currentModel && currentModel.reasoning
       const effort = (current && current.reasoningEffort) || (reasoning && reasoning.defaultEffort)
       const effortName = reasoning
-        ? ((reasoning.efforts || []).find((e) => e.id === effort) || {}).name || effort || 'Default'
+        ? ((reasoning.efforts || []).find((e) => e.id === effort) || {}).name || effort || t('picker.defaultEffort')
         : state.retainedEffort
       const busy = state.pending != null
 
@@ -1898,9 +2014,9 @@ window.__ModuleLoader__.load({
           if (res === undefined) return
           if (res.ok) close(true)
           else setError(res.error && res.error.code === 'session/writer-held'
-            ? '当前会话已被其他 DSH 实例占用，请退出其他实例后重试'
-            : '切换失败：' + ((res.error && res.error.message) || 'unknown'))
-        }, (e) => setError('切换失败：' + msg(e)))
+            ? t('picker.writerHeld')
+            : fillText(t, 'picker.switchFailed', { reason: (res.error && res.error.message) || t('picker.unknownError') }))
+        }, (e) => setError(fillText(t, 'picker.switchFailed', { reason: msg(e) })))
       }
       const chooseModel = (group, model) => {
         if (current && current.provider === group.id && current.model === model.id) {
@@ -1910,11 +2026,20 @@ window.__ModuleLoader__.load({
         const def = model.reasoning && model.reasoning.defaultEffort
         submit({ provider: group.id, model: model.id, ...(def === undefined ? {} : { reasoningEffort: def }) })
       }
-      const chooseEffort = (id) => {
-        if (!current || id === effort) return
-        submit({ provider: current.provider, model: current.model, ...(id === undefined ? {} : { reasoningEffort: id }) })
+      // Picking the effort already in use closes the menu, as picking the
+      // current model does.
+      const chooseEffort = (effortId) => {
+        if (!current) return
+        if (effortId === effort) {
+          close(true)
+          return
+        }
+        submit({ provider: current.provider, model: current.model, ...(effortId === undefined ? {} : { reasoningEffort: effortId }) })
       }
 
+      // On the root only: React bubbles events from the portalled menu up the
+      // component tree to the root, so a second handler on the menu ran every
+      // key twice (Enter chose the model twice).
       const onKeyDown = (e) => {
         if (e.nativeEvent && e.nativeEvent.isComposing) return
         if (!open) return
@@ -1944,68 +2069,82 @@ window.__ModuleLoader__.load({
       const loading = state.status === 'loading'
       const label = currentModel
         ? (currentModel.name || currentModel.id)
-        : loading ? '正在加载模型…' : '请选择模型'
+        : loading ? t('picker.loading') : t('picker.choose')
       const triggerTitle = currentModel
-        ? `${currentGroup.name}${currentGroup.ratio ? ' ×' + currentGroup.ratio : ''} · ${label}${effortName ? ' · ' + effortName : ''}`
+        ? `${currentGroup.name}${currentGroup.ratio ? RATIO_MARK + ratioText(currentGroup.ratio) : ''} · ${label}${effortName ? ' · ' + effortName : ''}`
         : label
+      // The search box points screen readers at the highlighted row. A row's
+      // id follows its model (group, and place in the group's full list), so
+      // moving the highlight, switching group or narrowing the search each
+      // names a new row, which they announce.
+      const listId = id + '-models'
+      const groupIndex = groups.indexOf(shownGroup)
+      const optionId = (m) => id + '-model-' + groupIndex + '-' + shownGroup.models.indexOf(m)
+      const activeModel = shownModels[hl]
 
       rowRefs.current = []
       const menu = open && pos ? createPortal(h('div', {
         ref: menuRef,
         className: 'pxm-menu',
         role: 'dialog',
-        'aria-label': '选择模型',
+        'aria-label': t('picker.title'),
         style: { left: pos.left + 'px', bottom: pos.bottom + 'px' },
-        onKeyDown,
       },
         h('input', {
           ref: searchRef,
           className: 'pxm-search',
-          placeholder: '搜索模型…（↑↓ 选择，Alt+←→ 切换分组，Enter 确认）',
+          role: 'searchbox',
+          'aria-label': t('picker.search'),
+          'aria-controls': listId,
+          'aria-activedescendant': activeModel ? optionId(activeModel) : undefined,
+          placeholder: t('picker.search'),
           value: query,
           onChange: (e) => { setQuery(e.target.value); setHl(0) },
         }),
         error ? h('div', { className: 'pxm-warn' }, h('span', null, error)) : null,
         state.error ? h('div', { className: 'pxm-warn' },
-          h('span', null, '模型目录加载失败：' + state.error),
-          h('button', { type: 'button', onClick: load }, '重试')) : null,
+          h('span', null, fillText(t, 'picker.catalogFailed', { reason: state.error })),
+          h('button', { type: 'button', onClick: load }, t('action.retry'))) : null,
         (state.failures || []).map((f) => h('div', { key: 'f:' + f.id, className: 'pxm-warn' },
-          h('span', null, `${splitRatio(String(f.name || f.id)).name} 加载失败：${f.message}`),
-          h('button', { type: 'button', onClick: load }, '重试'))),
+          h('span', null, fillText(t, 'picker.groupFailed', { group: splitRatio(groupName(f)).name, reason: f.message })),
+          h('button', { type: 'button', onClick: load }, t('action.retry')))),
         h('div', { className: 'pxm-body' },
-          h('div', { className: 'pxm-col pxm-left', role: 'listbox', 'aria-label': '模型分组' },
-            h('div', { className: 'pxm-heading' }, '模型分组'),
+          h('div', { className: 'pxm-col pxm-left', role: 'listbox', 'aria-label': t('picker.groups') },
+            h('div', { className: 'pxm-heading' }, t('picker.groups')),
             visibleGroups.length === 0
-              ? h('div', { className: 'pxm-note' }, loading ? '正在刷新模型列表…' : (groups.length ? '没有匹配的分组' : '暂无可用模型'))
+              ? h('div', { className: 'pxm-note' }, loading ? t('picker.refreshing') : (groups.length ? t('picker.noMatch') : t('picker.empty')))
               : visibleGroups.map((g) => h('button', {
                 key: g.id,
                 type: 'button',
                 role: 'option',
                 'aria-selected': g === shownGroup,
                 className: 'pxm-row' + (g === shownGroup ? ' active' : ''),
-                title: `${g.name}${g.key ? '\nID：' + g.key : ''}${g.ratio ? '\n倍率：×' + g.ratio : ''}`,
+                title: [g.name,
+                  g.key ? fillText(t, 'picker.tip.id', { id: g.key }) : '',
+                  g.ratio ? fillText(t, 'picker.tip.ratio', { ratio: ratioText(g.ratio) }) : ''].filter(Boolean).join('\n'),
                 onClick: () => { setActiveGroup(g.id); setHl(0); searchRef.current && searchRef.current.focus() },
               },
                 h('span', { className: 'pxm-gtext' },
                   h('span', { className: 'pxm-name' }, g.name),
-                  g.key && g.key !== g.name ? h('span', { className: 'pxm-gid' }, 'ID: ' + g.key) : null),
-                current && current.provider === g.id ? h('span', { className: 'pxm-dot', title: '当前模型所在分组' }) : null,
-                g.ratio ? h('span', { className: 'pxm-ratio ' + ratioTone(g.ratio) }, '×' + g.ratio) : null,
+                  g.key && g.key !== g.name ? h('span', { className: 'pxm-gid' }, fillText(t, 'picker.groupId', { id: g.key })) : null),
+                current && current.provider === g.id ? h('span', { className: 'pxm-dot', title: t('picker.currentGroup') }) : null,
+                g.ratio ? h('span', { className: 'pxm-ratio ' + ratioTone(g.ratio) }, '×' + ratioText(g.ratio)) : null,
               ))),
-          h('div', { className: 'pxm-col pxm-right', role: 'listbox', 'aria-label': '模型' },
+          h('div', { id: listId, className: 'pxm-col pxm-right', role: 'listbox', 'aria-label': t('picker.models') },
             h('div', { className: 'pxm-heading' },
               shownGroup
                 ? [shownGroup.name,
-                  shownGroup.key && shownGroup.key !== shownGroup.name ? 'ID ' + shownGroup.key : '',
-                  shownGroup.ratio ? '倍率 ×' + shownGroup.ratio : ''].filter(Boolean).join(' · ')
-                : '模型'),
-            loading && shownModels.length === 0 ? h('div', { className: 'pxm-note' }, '正在刷新模型列表…') : null,
-            !loading && shownGroup && shownModels.length === 0 ? h('div', { className: 'pxm-note' }, '该分组暂无模型') : null,
+                  shownGroup.key && shownGroup.key !== shownGroup.name ? fillText(t, 'picker.head.id', { id: shownGroup.key }) : '',
+                  shownGroup.ratio ? fillText(t, 'picker.head.ratio', { ratio: ratioText(shownGroup.ratio) }) : ''].filter(Boolean).join(' · ')
+                : t('picker.models')),
+            loading && shownModels.length === 0 ? h('div', { className: 'pxm-note' }, t('picker.refreshing')) : null,
+            !loading && shownGroup && shownModels.length === 0 ? h('div', { className: 'pxm-note' }, t('picker.groupEmpty')) : null,
             shownModels.map((m, i) => {
               const selected = current && shownGroup && current.provider === shownGroup.id && current.model === m.id
               const pending = state.pending && shownGroup && state.pending.provider === shownGroup.id && state.pending.model === m.id
               return h('button', {
                 key: m.id,
+                id: optionId(m),
                 ref: (el) => { rowRefs.current[i] = el },
                 type: 'button',
                 role: 'option',
@@ -2017,16 +2156,16 @@ window.__ModuleLoader__.load({
                 onClick: () => chooseModel(shownGroup, m),
               },
                 h('span', { className: 'pxm-name' }, m.name || m.id),
-                pending ? h('span', { className: 'pxm-note', style: { padding: 0 } }, '切换中…') : selected ? h(SmallCheck) : null,
+                pending ? h('span', { className: 'pxm-note', style: { padding: 0 } }, t('picker.switching')) : selected ? h(SmallCheck) : null,
               )
             }),
           ),
         ),
         reasoning && (reasoning.efforts || []).length > 0
           ? h('div', { className: 'pxm-foot' },
-            h('span', null, '推理等级'),
+            h('span', null, t('picker.effort')),
             reasoning.defaultEffort === undefined
-              ? h('button', { type: 'button', disabled: busy, className: 'pxm-chip' + (effort === undefined ? ' on' : ''), onClick: () => chooseEffort(undefined) }, 'Default')
+              ? h('button', { type: 'button', disabled: busy, className: 'pxm-chip' + (effort === undefined ? ' on' : ''), onClick: () => chooseEffort(undefined) }, t('picker.defaultEffort'))
               : null,
             reasoning.efforts.map((lv) => h('button', {
               key: lv.id, type: 'button', disabled: busy,
@@ -2043,13 +2182,17 @@ window.__ModuleLoader__.load({
           className: 'pxm-trigger',
           'aria-haspopup': 'dialog',
           'aria-expanded': open,
+          'aria-busy': busy,
           title: triggerTitle,
           disabled: locked,
           onClick: () => (open ? close(true) : show()),
         },
           h('span', { className: 'pxm-trigger-label' }, label),
           effortName && currentModel ? h('span', { className: 'pxm-trigger-effort' }, effortName) : null,
-          h(ChevronIcon, { className: 'pxm-chevron' + (open ? ' open' : '') + (busy ? '' : '') }),
+          // A switch in flight spins in place of the chevron, open menu or not.
+          busy
+            ? h('span', { className: 'pxm-busy' }, h(Spinner, { size: 12 }))
+            : h(ChevronIcon, { className: 'pxm-chevron' + (open ? ' open' : '') }),
         ),
         menu,
       )
