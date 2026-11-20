@@ -56,7 +56,7 @@ https://github.com/PIXEL-AI-API/dsh-pixel-api#v0.1.0
 
 ## 支持的能力
 
-- **文本与工具调用**：标准的对话、多轮工具调用、思考内容回传。
+- **文本与工具调用**：标准的对话、多轮工具调用、思考内容回传。工具结果按 OpenAI 的 `tool` 消息发送，紧跟在发起调用的那条回复之后；工具结果里的图片随后以一条 user 消息附上。
 - **图片输入**：带图片的消息按 OpenAI `image_url` 数据 URL 发给主站，由主站转发给所选分组的上游模型。能否被理解取决于该分组背后的模型是否支持视觉；只支持文本的模型会由上游自己报错，错误信息原样显示。图片先按 Harness 的附件策略归一化（默认上限 1M 像素、约 1.5 MB），过旧的历史图片可能被替换成占位文字而不是让整次请求失败。
 - **推理等级**：模型菜单底部提供 `Minimal / Low / Medium / High / Xhigh / Max` 六档，选中后以 `reasoning_effort` 字段发给主站，由主站转换成各上游模型的格式（Claude 的 `output_config.effort`、Gemini 的 `thinkingConfig`、OpenAI 直传）。**不选则不发该字段**，由上游使用自己的默认强度。各分组背后的实际模型由主站决定，因此档位对所有分组统一显示；不支持思考的模型由上游自行报错。
 - **上下文窗口**：插件为每个 PIXEL 模型向 Harness 声明上下文窗口，Harness 据此决定何时自动压缩历史，以及会话中途能否切换到该模型。主站不提供各模型的实际上限，**默认按 272,000 token 计算**；在 **设置 → PIXEL API → 上下文窗口** 可以改默认值，也可以按模型单独设置（每行 `模型 ID = token 数`，以 `*` 结尾按前缀匹配，如 `gemini-* = 1048576`；精确 ID 优先，较长前缀优先，不区分大小写），从下一次请求起生效。窗口必须大于 65,536（Harness 压缩默认预留的余量），否则切换到该模型仍会被拒绝。宁可设小：设大了，历史超出上游真实上限时请求会失败。
@@ -74,7 +74,7 @@ https://github.com/PIXEL-AI-API/dsh-pixel-api#v0.1.0
 
 不联网、不用真实账号，主站接口全部在本地模拟：
 
-- `test/check-context.mjs`：用真实的 Harness `LlmRuntime` 加载插件，检查上下文窗口声明、按模型覆盖、设置页即时修改、拒答与超长错误的分类，以及各类上游的缓存用量映射。桌面版运行时下用 `ELECTRON_RUN_AS_NODE=1 "<DeepSeek Harness.exe>" test/check-context.mjs` 运行；能直接解析 `@deepseek-ai/*` 包的环境用 `node test/check-context.mjs`。
+- `test/check-context.mjs`：用真实的 Harness `LlmRuntime` 加载插件，检查上下文窗口声明、按模型覆盖、设置页即时修改、拒答与超长错误的分类、工具结果的发送格式（`tool` 消息、图片随后附上、空的 system 消息不发送），以及各类上游的缓存用量映射。桌面版运行时下用 `ELECTRON_RUN_AS_NODE=1 "<DeepSeek Harness.exe>" test/check-context.mjs` 运行；能直接解析 `@deepseek-ai/*` 包的环境用 `node test/check-context.mjs`。
 - `test/check-update.mjs`：一键更新。用真实的 git 读本地临时仓库里的真实标签，用插件管理自带的来源校验判断更新目标，再用假的插件管理逐一模拟更新结果（更新中被移除、拒绝、需要重启、失败后恢复），不安装任何东西。运行方式同上，需要 PATH 里有 git。
 - `test/check-client.mjs`：在 vm 里执行 `client.js`，操作设置页的上下文窗口卡片（显示、校验、保存、恢复默认）和插件更新卡片（检查、确认、各状态显示）。`node test/check-client.mjs`。
 - `test/check-load.mjs`、`test/check-fallback.mjs`：配置解析与图片缩放。

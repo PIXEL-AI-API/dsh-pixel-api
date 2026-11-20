@@ -452,13 +452,21 @@ const LOGIN_BACKOFF_MAX_MS = 30 * 60_000
 // `group` field the site's controller routes on).
 // ---------------------------------------------------------------------------
 
-// Join one block list's text blocks (user/system/tool-result content).
+// Join one block list's text blocks (user/system/tool content).
 function flattenText(blocks) {
   return blocks
     .filter((block) => block.type === 'text')
     .map((block) => block.text)
     .join('')
 }
+
+// Stands in for an image the Harness offloaded to fit the request limits, so
+// the model still learns an image was there.
+const OFFLOADED_IMAGE_TEXT = '[image omitted to fit the request limits]'
+// OpenAI tool messages carry text only: a run of tool results is followed by
+// one user message holding their images under this label, the same layout and
+// wording the shipped pi-ai adapter sends.
+const TOOL_RESULT_IMAGES_LABEL = 'Attached image(s) from tool result:'
 
 // Request-image budget: the attachment store takes a target size and a byte
 // bound, not a pixel budget. Width/height come from the source aspect ratio
@@ -479,10 +487,19 @@ function imageTarget(ref) {
   return { ...scale(width, height, IMAGE_MAX_PIXELS), maxBytes: IMAGE_MAX_BYTES }
 }
 
+// One retained image as an OpenAI `image_url` part. A data URL, because the
+// site's relay forwards it verbatim to the upstream model.
+async function imageUrlPart(block, images) {
+  const version = await images.read(block.attachment)
+  return {
+    type: 'image_url',
+    image_url: { url: `data:${version.mediaType};base64,${Buffer.from(version.data).toString('base64')}` },
+  }
+}
+
 // OpenAI chat-completions content parts for one block list. Text-only content
 // stays a plain string (smaller payload, accepted by every upstream model);
-// image blocks become `image_url` data URLs, which the site's relay forwards
-// verbatim to the upstream model.
+// image blocks become `image_url` parts.
 async function serializeContent(blocks, images) {
   if (!contentHasImage(blocks)) return flattenText(blocks)
   const parts = []
@@ -493,19 +510,33 @@ async function serializeContent(blocks, images) {
     }
     if (block.type !== 'image') continue
     if (block.offloaded === true) {
-      parts.push({ type: 'text', text: '[image omitted to fit the request limits]' })
+      parts.push({ type: 'text', text: OFFLOADED_IMAGE_TEXT })
       continue
     }
-    const version = await images.read(block.attachment)
-    parts.push({
-      type: 'image_url',
-      image_url: { url: `data:${version.mediaType};base64,${Buffer.from(version.data).toString('base64')}` },
-    })
+    parts.push(await imageUrlPart(block, images))
   }
   // An image-only turn must still carry a text part: some upstream models
   // reject a content array without one.
   if (!parts.some((part) => part.type === 'text')) parts.unshift({ type: 'text', text: '' })
   return parts
+}
+
+// One tool result as an OpenAI `tool` message plus the image parts it leaves
+// for the user message after the run of results (tool content is text only).
+// An offloaded image keeps its placeholder where it stood. A failed result
+// (isError) is sent as is: OpenAI has no field for it, and the text already
+// says what went wrong.
+async function serializeToolResult(toolCallId, blocks, images) {
+  const text = flattenText(blocks.map((block) => (block.type === 'image' && block.offloaded === true
+    ? { type: 'text', text: OFFLOADED_IMAGE_TEXT }
+    : block)))
+  const attached = []
+  for (const block of blocks) {
+    if (block.type === 'image' && block.offloaded !== true) attached.push(await imageUrlPart(block, images))
+  }
+  // Never empty: a blank tool message reads like a lost result to the model.
+  const content = text.length > 0 ? text : attached.length > 0 ? '(see attached image)' : '(no output)'
+  return { message: { role: 'tool', tool_call_id: toolCallId, content }, attached }
 }
 
 function serializeAssistant(message) {
@@ -537,40 +568,60 @@ function serializeAssistant(message) {
 
 async function serializeMessages(messages, images) {
   const wire = []
+  // Images of the current run of tool results. They go out together after
+  // the run: a user message between two tool messages would cut the answers
+  // to one assistant turn apart.
+  let toolImages = []
+  const flushToolImages = () => {
+    if (toolImages.length === 0) return
+    wire.push({ role: 'user', content: [{ type: 'text', text: TOOL_RESULT_IMAGES_LABEL }, ...toolImages] })
+    toolImages = []
+  }
+  const pushToolResult = async (toolCallId, blocks) => {
+    const { message, attached } = await serializeToolResult(toolCallId, blocks, images)
+    wire.push(message)
+    toolImages.push(...attached)
+  }
   for (const message of messages) {
+    if (message.role === 'tool') {
+      await pushToolResult(message.toolCallId, message.content)
+      continue
+    }
+    flushToolImages()
     if (message.role === 'system') {
       if (contentHasImage(message.content)) {
         throw new LlmError('pixel-api: a system message cannot carry an image', 'UNSUPPORTED_CONTENT')
       }
-      wire.push({ role: 'system', content: flattenText(message.content) })
+      // Empty content is the Harness's record of "no system prompt", not a
+      // prompt to send.
+      const text = flattenText(message.content)
+      if (text.length > 0) wire.push({ role: 'system', content: text })
       continue
     }
     if (message.role === 'assistant') {
       wire.push(serializeAssistant(message))
       continue
     }
-    // user role: tool results ride in user messages in the harness vocabulary,
-    // but the wire wants them as standalone role:'tool' messages.
+    // Older runtimes carry tool results as `tool-result` blocks inside a user
+    // message. The wire wants each answer right after the assistant turn that
+    // called it, so the results go out first and the rest of the user message
+    // follows.
     const toolResults = message.content.filter((block) => block.type === 'tool-result')
-    const content = await serializeContent(message.content, images)
+    for (const result of toolResults) await pushToolResult(result.toolCallId, result.content)
+    flushToolImages()
+    const content = await serializeContent(message.content.filter((block) => block.type !== 'tool-result'), images)
     const hasContent = typeof content === 'string' ? content.length > 0 : true
     if (hasContent || toolResults.length === 0) {
       wire.push({ role: 'user', content })
     }
-    for (const result of toolResults) {
-      wire.push({
-        role: 'tool',
-        tool_call_id: result.toolCallId,
-        content: flattenText(result.content) || '(no output)',
-      })
-    }
   }
+  flushToolImages()
   return wire
 }
 
 async function serializeRequest(options, group, images) {
   const messages = []
-  if (options.system !== undefined) {
+  if (options.system !== undefined && options.system.length > 0) {
     messages.push({ role: 'system', content: options.system })
   }
   messages.push(...await serializeMessages(options.messages, images))

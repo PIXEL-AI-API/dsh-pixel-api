@@ -1,4 +1,5 @@
-// Host-half check: declared context capacity, refusal and overflow mapping.
+// Host-half check: declared context capacity, refusal and overflow mapping,
+// and the wire shape of tool results.
 // Boots the real plugin module against the real LlmRuntime with a fake ctx and
 // a mocked PIXEL site — no network, no credentials, nothing billed.
 //
@@ -11,6 +12,7 @@
 import { writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { isDeepStrictEqual } from 'node:util'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const lines = []
@@ -118,6 +120,10 @@ const llm = app.get('llm')
 const registered = []
 const credentials = new Map([['PIXEL_API_REFRESH', 'seed-refresh']])
 const warnings = []
+// Image bytes per case. The default refuses, so a case that must not read an
+// image fails its request when it does.
+const noImages = async () => { throw new Error('no images in this check') }
+let readImageRequest = noImages
 const fakeCtx = {
   logger: { warn: (...parts) => warnings.push(parts.map(String).join(' ')), info() {}, debug() {}, error() {} },
   effect(fn) { fn(); return () => {} },
@@ -132,7 +138,7 @@ const fakeCtx = {
       }
     }
     if (name === 'configEditor') return { edit: async () => {} }
-    if (name === 'attachments') return { readImageRequest: async () => { throw new Error('no images in this check') } }
+    if (name === 'attachments') return { readImageRequest: (ref, target) => readImageRequest(ref, target) }
     return undefined
   },
   fiber: { entry: { id: 'pixel-api' } },
@@ -217,13 +223,13 @@ check('65536 window would still be refused (settings page minimum is 65537)', sp
 
 // ---------------------------------------------------------------------------
 log('Streams through the real LlmRuntime')
-const run = async (responder) => {
+const run = async (responder, messages = [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }]) => {
   chat = responder
   const chunks = []
   for await (const chunk of llm.stream({
     provider: 'pixel/room-1024',
     model: 'gemini-4-hydrogen',
-    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    messages,
   })) chunks.push(chunk)
   return chunks
 }
@@ -316,6 +322,117 @@ await usageCase('cache split larger than the prompt is clamped', {
 await usageCase('missing total is derived by the runtime', {
   prompt_tokens: 40, completion_tokens: 2, prompt_tokens_details: { cached_tokens: 30 },
 }, { inputTokens: 10, outputTokens: 2, totalTokens: undefined, cacheReadTokens: 30, cacheWriteTokens: 0 })
+
+// ---------------------------------------------------------------------------
+// Harness 0.2.2-rc.3 history: each tool result is its own role:'tool' message.
+// The wire must answer each call with an OpenAI tool message, and carry a
+// result's images in one user message after the run (pi-ai's layout).
+log('Tool results on the wire')
+const ROUTE = { provider: 'pixel/room-1024', model: 'gemini-4-hydrogen' }
+const textBlock = (text) => ({ type: 'text', text })
+const imageBlock = (attachmentId, offloaded = false) => ({
+  type: 'image',
+  attachment: { attachmentId, mediaType: 'image/png', width: 64, height: 32 },
+  ...(offloaded ? { offloaded: true } : {}),
+})
+const userSays = (text) => ({ role: 'user', content: [textBlock(text)] })
+const systemSays = (text) => ({ role: 'system', source: { kind: 'system-prompt' }, content: text === '' ? [] : [textBlock(text)] })
+const assistantSays = (text) => ({ role: 'assistant', source: { kind: 'model', ...ROUTE }, content: [textBlock(text)] })
+const callsTools = (...ids) => ({
+  role: 'assistant',
+  source: { kind: 'model', ...ROUTE },
+  content: ids.map((id) => ({ type: 'tool-call', id, name: 'read', arguments: `{"id":"${id}"}` })),
+})
+const toolAnswers = (id, content, isError = false) => ({ role: 'tool', source: { kind: 'tool', callId: id }, toolCallId: id, isError, content })
+const wireCalls = (...ids) => ({
+  role: 'assistant',
+  content: '',
+  tool_calls: ids.map((id) => ({ id, type: 'function', function: { name: 'read', arguments: `{"id":"${id}"}` } })),
+})
+const wireTool = (id, content) => ({ role: 'tool', tool_call_id: id, content })
+// The image reader below returns each attachment id's bytes, so a data URL
+// names the image it came from.
+const wireImage = (attachmentId) => ({
+  type: 'image_url',
+  image_url: { url: `data:image/png;base64,${Buffer.from(attachmentId).toString('base64')}` },
+})
+const wireToolImages = (...ids) => ({
+  role: 'user',
+  content: [{ type: 'text', text: 'Attached image(s) from tool result:' }, ...ids.map(wireImage)],
+})
+// One history through the real runtime; `wire` is what reached the site
+// (empty when the request failed before sending).
+const send = async (messages) => {
+  const sent = chatBodies.length
+  const chunks = await run(() => sse([choice({ content: 'ok' }), choice({}, 'stop'), usage, '[DONE]']), messages)
+  return { wire: chatBodies.length > sent ? chatBodies.at(-1).messages : [], finish: finishOf(chunks) }
+}
+
+let sent = await send([userSays('read a'), callsTools('call_a'), toolAnswers('call_a', [textBlock('contents of a')])])
+check('result is a role:tool message right after the calling turn', isDeepStrictEqual(sent.wire, [
+  { role: 'user', content: 'read a' },
+  wireCalls('call_a'),
+  wireTool('call_a', 'contents of a'),
+]), sent)
+check('no user message carries the tool output',
+  sent.wire.length > 0 && !sent.wire.some((m) => m.role === 'user' && JSON.stringify(m.content).includes('contents of a')), sent)
+
+sent = await send([userSays('read both'), callsTools('call_a', 'call_b'),
+  toolAnswers('call_a', [textBlock('A')]), toolAnswers('call_b', [textBlock('B')])])
+check('parallel results keep their order', isDeepStrictEqual(sent.wire.slice(1), [
+  wireCalls('call_a', 'call_b'),
+  wireTool('call_a', 'A'),
+  wireTool('call_b', 'B'),
+]), sent)
+
+sent = await send([userSays('touch'), callsTools('call_a'), toolAnswers('call_a', [])])
+check('empty result -> (no output)', isDeepStrictEqual(sent.wire.at(-1), wireTool('call_a', '(no output)')), sent)
+
+sent = await send([userSays('read'), callsTools('call_a'), toolAnswers('call_a', [textBlock('ENOENT: no such file')], true)])
+check('failed result is sent verbatim', isDeepStrictEqual(sent.wire.at(-1), wireTool('call_a', 'ENOENT: no such file')), sent)
+
+readImageRequest = async (ref) => ({ mediaType: 'image/png', data: Buffer.from(ref.attachmentId) })
+sent = await send([userSays('screenshot'), callsTools('call_a'), toolAnswers('call_a', [imageBlock('img-1')])])
+check('image-only result -> (see attached image), then one labelled user message', isDeepStrictEqual(sent.wire.slice(2), [
+  wireTool('call_a', '(see attached image)'),
+  wireToolImages('img-1'),
+]), sent)
+sent = await send([userSays('two shots'), callsTools('call_a', 'call_b'),
+  toolAnswers('call_a', [imageBlock('img-1')]), toolAnswers('call_b', [textBlock('saved'), imageBlock('img-2')]), userSays('thanks')])
+check('a run of results sends all its images in one user message after the run', isDeepStrictEqual(sent.wire.slice(2), [
+  wireTool('call_a', '(see attached image)'),
+  wireTool('call_b', 'saved'),
+  wireToolImages('img-1', 'img-2'),
+  { role: 'user', content: 'thanks' },
+]), sent)
+readImageRequest = noImages
+
+sent = await send([userSays('screenshot'), callsTools('call_a'),
+  toolAnswers('call_a', [textBlock('shot: '), imageBlock('img-1', true)])])
+check('offloaded image -> placeholder text, no user message', isDeepStrictEqual(sent.wire.slice(2), [
+  wireTool('call_a', 'shot: [image omitted to fit the request limits]'),
+]), sent)
+
+sent = await send([systemSays('be brief'), userSays('hi'), assistantSays('hello'), systemSays(''), userSays('again')])
+check('empty system message in the history is not sent', isDeepStrictEqual(sent.wire, [
+  { role: 'system', content: 'be brief' },
+  { role: 'user', content: 'hi' },
+  { role: 'assistant', content: 'hello' },
+  { role: 'user', content: 'again' },
+]), sent)
+
+// Older runtimes put tool results in a user message as `tool-result` blocks.
+const legacyResult = (id, text) => ({ type: 'tool-result', toolCallId: id, content: [textBlock(text)] })
+sent = await send([userSays('read'), callsTools('call_a'),
+  { role: 'user', content: [legacyResult('call_a', 'legacy A'), textBlock('and summarize')] }])
+check('legacy tool-result block: tool message first, then the rest of the user message', isDeepStrictEqual(sent.wire.slice(2), [
+  wireTool('call_a', 'legacy A'),
+  { role: 'user', content: 'and summarize' },
+]), sent)
+sent = await send([userSays('read'), callsTools('call_a'), { role: 'user', content: [legacyResult('call_a', 'legacy A')] }])
+check('legacy results alone add no empty user message', isDeepStrictEqual(sent.wire.slice(2), [
+  wireTool('call_a', 'legacy A'),
+]), sent)
 
 check('every site request refused redirects', redirectViolations === 0, redirectViolations)
 check('no plugin warnings', warnings.length === 0, warnings)
