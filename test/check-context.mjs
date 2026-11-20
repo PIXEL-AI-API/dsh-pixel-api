@@ -1,5 +1,6 @@
 // Host-half check: declared context capacity, error classification (HTTP
-// errors and stream error frames), and the wire shape of tool results.
+// errors and stream error frames), session refresh failures, and the wire
+// shape of tool results.
 // Boots the real plugin module against the real LlmRuntime with a fake ctx and
 // a mocked PIXEL site — no network, no credentials, nothing billed.
 //
@@ -74,13 +75,24 @@ const sse = (events, headers = {}) => new Response(new ReadableStream({
     controller.close()
   },
 }), { status: 200, headers: { 'content-type': 'text/event-stream', ...headers } })
-let redirectViolations = 0
-globalThis.fetch = async (url, init = {}) => {
-  const target = new URL(String(url))
-  if (target.origin !== SITE) throw new Error(`unexpected host ${target.origin}`)
-  if (init.redirect !== 'error') redirectViolations += 1
-  switch (target.pathname) {
-    case '/api/user/auth/refresh':
+// Session refresh outcome, switched per case. The failures are the site's own
+// shapes (new-api-main controller/auth_session.go writeAuthSessionError) and
+// what undici throws when the site cannot be reached.
+let refreshMode = 'ok'
+const refreshReply = () => {
+  switch (refreshMode) {
+    case 'network':
+      throw new TypeError('fetch failed', {
+        cause: Object.assign(new Error('getaddrinfo ENOTFOUND api.ai-pixel.online'), { code: 'ENOTFOUND' }),
+      })
+    case '500':
+      return json({ success: false, code: 'AUTH_INTERNAL_ERROR', message: 'Internal Server Error' }, 500)
+    case '502':
+      return new Response('<html><head><title>502 Bad Gateway</title></head><body><center>nginx</center></body></html>',
+        { status: 502, headers: { 'content-type': 'text/html' } })
+    case '401':
+      return json({ success: false, code: 'AUTH_SESSION_REVOKED', message: 'Unauthorized' }, 401)
+    default:
       return json({
         success: true,
         data: {
@@ -90,6 +102,16 @@ globalThis.fetch = async (url, init = {}) => {
           user: { username: 'tester' },
         },
       })
+  }
+}
+let redirectViolations = 0
+globalThis.fetch = async (url, init = {}) => {
+  const target = new URL(String(url))
+  if (target.origin !== SITE) throw new Error(`unexpected host ${target.origin}`)
+  if (init.redirect !== 'error') redirectViolations += 1
+  switch (target.pathname) {
+    case '/api/user/auth/refresh':
+      return refreshReply()
     case '/api/user/self/groups':
       return json({ success: true, data: { 'room-1024': { is_room: true, room_name: 'Room 1024', ratio: 0.5, kind: 'pool' }, default: { ratio: 1 } } })
     case '/api/pricing':
@@ -124,7 +146,8 @@ const warnings = []
 // image fails its request when it does.
 const noImages = async () => { throw new Error('no images in this check') }
 let readImageRequest = noImages
-const fakeCtx = {
+// A fake ctx around one real LlmRuntime; `edit` receives the status writes.
+const fakeCtxFor = ({ runtime, credentials, warnings, registered, edit = async () => {} }) => ({
   logger: { warn: (...parts) => warnings.push(parts.map(String).join(' ')), info() {}, debug() {}, error() {} },
   effect(fn) { fn(); return () => {} },
   on() { return () => {} },
@@ -137,7 +160,7 @@ const fakeCtx = {
         unset: async (ref) => { credentials.delete(ref) },
       }
     }
-    if (name === 'configEditor') return { edit: async () => {} }
+    if (name === 'configEditor') return { edit }
     if (name === 'attachments') return { readImageRequest: (ref, target) => readImageRequest(ref, target) }
     return undefined
   },
@@ -145,10 +168,11 @@ const fakeCtx = {
   llm: {
     registerAdapter(ids, adapter) {
       registered.push(ids)
-      return llm.registerAdapter(ids, adapter)
+      return runtime.registerAdapter(ids, adapter)
     },
   },
-}
+})
+const fakeCtx = fakeCtxFor({ runtime: llm, credentials, warnings, registered })
 
 const config = plugin.Config({
   username: 'tester',
@@ -538,6 +562,138 @@ sent = await send([userSays('read'), callsTools('call_a'), { role: 'user', conte
 check('legacy results alone add no empty user message', isDeepStrictEqual(sent.wire.slice(2), [
   wireTool('call_a', 'legacy A'),
 ]), sent)
+
+// ---------------------------------------------------------------------------
+// A refresh the site never answered, or answered with a 5xx, says nothing
+// about the session: the request fails in a code the Harness retries and the
+// refresh cookie stays. Only the site's refusal is AUTH.
+log('Session refresh failures: chat requests')
+const answered = () => sse([choice({ content: 'ok' }), choice({}, 'stop'), usage, '[DONE]'])
+const refreshCases = [
+  ['unreachable -> TRANSPORT, with the network reason', 'network',
+    { code: 'TRANSPORT', status: undefined, message: 'pixel-api: session refresh failed: 连不上 PIXEL 主站：getaddrinfo ENOTFOUND api.ai-pixel.online' }],
+  ['500 -> SERVER', '500', { code: 'SERVER', status: 500 }],
+  ['502 HTML from the gateway -> SERVER', '502', { code: 'SERVER', status: 502 }],
+  ['refused (401) -> AUTH, the wording as before', '401',
+    { code: 'AUTH', message: 'pixel-api: session refresh failed: Unauthorized' }],
+]
+for (const [label, mode, expected] of refreshCases) {
+  refreshMode = 'ok'
+  await run(answered) // a fresh access token, so the 401 below forces a refresh
+  refreshMode = mode
+  const failure = finishOf(await run(httpError(401, siteError('', 'new_api_error', '未登录或登录已过期'))))?.failure
+  check(`chat 401, then the refresh: ${label}`, failureMatches(failure, expected), failure)
+  if (mode !== '401') {
+    check('  ...the refresh cookie is kept', credentials.get('PIXEL_API_REFRESH') === 'seed-refresh', [...credentials.keys()])
+  }
+}
+refreshMode = 'ok'
+chunks = await run(answered)
+check('site back: the next request goes through', finishOf(chunks)?.kind === 'stop', finishOf(chunks))
+
+// ---------------------------------------------------------------------------
+// The sign-in state, in instances of their own (runtime, credentials, logger,
+// status store). Timers of 10 s or more are held instead of armed, so a retry
+// fires when the test says so; shorter ones (the polling below) run for real.
+log('Session refresh failures: sign-in state (reconcile)')
+const realSetTimeout = globalThis.setTimeout
+const realClearTimeout = globalThis.clearTimeout
+const heldTimers = []
+globalThis.setTimeout = (callback, ms, ...args) => {
+  if (!(ms >= 10_000)) return realSetTimeout(callback, ms, ...args)
+  const timer = { callback, ms, fired: false, cleared: false, unref: () => timer }
+  heldTimers.push(timer)
+  return timer
+}
+globalThis.clearTimeout = (timer) => {
+  if (heldTimers.includes(timer)) timer.cleared = true
+  else realClearTimeout(timer)
+}
+const pendingTimers = () => heldTimers.filter((timer) => !timer.fired && !timer.cleared)
+// Fires the pending retry, if there is one (none is a failure the checks report).
+const firePending = () => {
+  const timer = pendingTimers()[0]
+  if (timer === undefined) return
+  timer.fired = true
+  timer.callback()
+}
+const until = async (condition) => {
+  for (let i = 0; i < 100 && !condition(); i++) await new Promise((r) => realSetTimeout(r, 20))
+}
+// Lets the plugin's queued promise work run to its end.
+const drain = () => new Promise((r) => realSetTimeout(r, 0))
+const bootInstance = async (refreshCookie) => {
+  const instanceApp = new Context()
+  await instanceApp.plugin(LlmRuntime)
+  const instanceConfig = plugin.Config({ username: 'tester' })
+  const instance = {
+    credentials: new Map([['PIXEL_API_REFRESH', refreshCookie]]),
+    warnings: [],
+    registered: [],
+    statuses: [],
+    status: () => instance.statuses.at(-1),
+  }
+  // The host commits each status write into the config cell, the copy the
+  // plugin compares its next write against.
+  const edit = async (entry, change) => {
+    const { auth } = change({})
+    if (auth === undefined) return
+    instance.statuses.push(auth)
+    instanceConfig.auth[WRITE](auth)
+  }
+  plugin.apply(fakeCtxFor({
+    runtime: instanceApp.get('llm'),
+    credentials: instance.credentials,
+    warnings: instance.warnings,
+    registered: instance.registered,
+    edit,
+  }), instanceConfig)
+  return instance
+}
+const statusIs = (status, state, message, user) =>
+  status?.state === state && status?.message === message && (user === undefined || status?.user === user)
+
+refreshMode = 'network'
+const offline = await bootInstance('seed-refresh-b')
+await until(() => pendingTimers().length > 0)
+check('site unreachable at start: no routes registered', offline.registered.length === 0, offline.registered)
+check('  ...the refresh cookie is kept', offline.credentials.get('PIXEL_API_REFRESH') === 'seed-refresh-b', [...offline.credentials.keys()])
+check('  ...status error, with the fixed retry text and the configured user',
+  statusIs(offline.status(), 'error', '暂时连不上 PIXEL 主站，登录状态已保留，稍后自动重试', 'tester'), offline.status())
+check('  ...the reason goes to the log only',
+  offline.warnings.some((line) => line.includes('getaddrinfo ENOTFOUND')) && !offline.status()?.message.includes('ENOTFOUND'), offline.warnings)
+check('  ...one retry pending, due in 15 s', pendingTimers().length === 1 && pendingTimers()[0].ms === 15_000,
+  pendingTimers().map((timer) => timer.ms))
+const delays = [pendingTimers()[0]?.ms]
+for (let i = 0; i < 6 && pendingTimers().length === 1; i++) {
+  firePending()
+  await until(() => pendingTimers().length > 0)
+  delays.push(pendingTimers().length === 1 ? pendingTimers()[0].ms : `${pendingTimers().length} pending`)
+}
+check('still unreachable: each failed retry schedules one more, 15 s doubling to at most 5 min',
+  isDeepStrictEqual(delays, [15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000]), delays)
+check('  ...the status is written once, not once per retry', offline.statuses.length === 1, offline.statuses)
+
+refreshMode = 'ok'
+firePending()
+await until(() => offline.registered.length > 0 && offline.status()?.state === 'ok')
+check('site back, the retry fires: routes registered',
+  JSON.stringify(offline.registered[0]) === JSON.stringify(['pixel/room-1024', 'pixel/default']), offline.registered)
+check('  ...status ok', statusIs(offline.status(), 'ok', '', 'tester'), offline.status())
+check('  ...no retry left pending', pendingTimers().length === 0, pendingTimers().map((timer) => timer.ms))
+
+refreshMode = '401'
+const heldBefore = heldTimers.length
+const refused = await bootInstance('seed-refresh-c')
+await until(() => refused.status()?.state === 'none')
+await drain()
+check('refresh refused at start: the refresh cookie is dropped', !refused.credentials.has('PIXEL_API_REFRESH'), [...refused.credentials.keys()])
+check('  ...status none, asking to sign in again', statusIs(refused.status(), 'none', '登录会话已过期，请重新登录'), refused.status())
+check('  ...no retry scheduled', heldTimers.length === heldBefore, heldTimers.slice(heldBefore).map((timer) => timer.ms))
+check('  ...no routes registered', refused.registered.length === 0, refused.registered)
+refreshMode = 'ok'
+globalThis.setTimeout = realSetTimeout
+globalThis.clearTimeout = realClearTimeout
 
 check('every site request refused redirects', redirectViolations === 0, redirectViolations)
 check('no plugin warnings', warnings.length === 0, warnings)

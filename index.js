@@ -358,6 +358,19 @@ const SITE = 'https://api.ai-pixel.online'
 // Authorization header (and a login body, password included) to whatever host
 // the redirect names.
 const siteFetch = (url, init) => fetch(url, { redirect: 'error', ...init })
+// A site call that did not succeed; `status` is 0 when the site could not be
+// reached at all. Only a 4xx other than 408, 409 and 429 is the site refusing
+// outright. Anything else may pass on its own, and taking a passing failure
+// for a refusal signs the user out, so it counts as retryable.
+class SiteError extends Error {
+  constructor(message, status, options) {
+    super(message, options)
+    this.name = 'SiteError'
+    this.status = status
+    this.retryable = !(status >= 400 && status < 500 && status !== 408 && status !== 409 && status !== 429)
+  }
+}
+const isRetryableSiteError = (error) => error instanceof SiteError && error.retryable
 const NS = 'pixel-api'
 const ROUTE_PREFIX = 'pixel/'
 const REFRESH_COOKIE = 'new_api_refresh'
@@ -446,6 +459,13 @@ function formatQuota(quota, display) {
 // Failed password logins back off exponentially: 1m, 2m, 4m … capped at 30m.
 const LOGIN_BACKOFF_BASE_MS = 60_000
 const LOGIN_BACKOFF_MAX_MS = 30 * 60_000
+// After a passing site failure, reconcile retries on a delay that doubles from
+// 15 s to at most 5 min: an outage costs no sign-in, and a long one no flood.
+const SITE_RETRY_BASE_MS = 15_000
+const SITE_RETRY_MAX_MS = 5 * 60_000
+// Fixed text: every status write re-runs reconcile, so a message carrying the
+// failure's changing reason would loop. The reason goes to the log instead.
+const SITE_RETRY_MESSAGE = '暂时连不上 PIXEL 主站，登录状态已保留，稍后自动重试'
 
 // ---------------------------------------------------------------------------
 // Wire serialization (OpenAI chat-completions shape plus the playground
@@ -1150,7 +1170,13 @@ export function apply(ctx, config) {
   const debugOn = debugCell && typeof debugCell.get === 'function' ? debugCell.get() : debugCell
   if (debugOn === true) DEBUG_ENABLED = true
   trace('apply start')
-  ctx.effect(() => () => { disposed = true; trace('fiber disposed') }, 'pixel-api: teardown')
+  // The pending reconcile retry after a passing site failure (scheduleRetry).
+  let retryTimer
+  ctx.effect(() => () => {
+    disposed = true
+    clearTimeout(retryTimer)
+    trace('fiber disposed')
+  }, 'pixel-api: teardown')
 
   const state = {
     accessToken: '',
@@ -1473,10 +1499,17 @@ export function apply(ctx, config) {
   }
 
   const apiJson = async (path, init) => {
-    const res = await siteFetch(`${SITE}${path}`, {
-      ...init,
-      headers: { ...attributionHeaders(), ...init?.headers },
-    })
+    let res
+    try {
+      res = await siteFetch(`${SITE}${path}`, {
+        ...init,
+        headers: { ...attributionHeaders(), ...init?.headers },
+      })
+    } catch (error) {
+      // undici reports every network failure as "fetch failed" and keeps the
+      // reason (DNS, refused, reset, TLS) in `cause`.
+      throw new SiteError(`连不上 PIXEL 主站：${describeFailure(error?.cause ?? error)}`, 0, { cause: error })
+    }
     const body = await res.json().catch(() => null)
     return { res, body }
   }
@@ -1559,7 +1592,7 @@ export function apply(ctx, config) {
       },
     })
     if (!body?.success) {
-      throw new Error(body?.message ?? `session refresh failed (HTTP ${res.status})`)
+      throw new SiteError(body?.message ?? `session refresh failed (HTTP ${res.status})`, res.status)
     }
     adoptBundle(body.data ?? {}, res)
   }
@@ -1667,6 +1700,27 @@ export function apply(ctx, config) {
     })
   }
 
+  // At most one pending retry; each consecutive passing failure doubles the
+  // delay. A successful group load or a teardown ends the series.
+  let retryRound = 0
+  const scheduleRetry = () => {
+    if (retryTimer !== undefined || disposed) return
+    const delay = Math.min(SITE_RETRY_BASE_MS * 2 ** retryRound, SITE_RETRY_MAX_MS)
+    retryRound++
+    trace('reconcile retry scheduled', { delayS: delay / 1000 })
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined
+      reconcile()
+    }, delay)
+    // A pending retry must not keep the host process alive.
+    retryTimer.unref?.()
+  }
+  const cancelRetry = () => {
+    clearTimeout(retryTimer)
+    retryTimer = undefined
+    retryRound = 0
+  }
+
   const applyGroups = async (username, force = false) => {
     const key = `${state.sid}::${username}`
     // Full reloads (groups + pricing catalog) are the expensive ones on the
@@ -1686,7 +1740,7 @@ export function apply(ctx, config) {
         headers: { authorization: `Bearer ${state.accessToken}` },
       })
       if (!body?.success) {
-        throw new Error(body?.message ?? `group list failed (HTTP ${res.status})`)
+        throw new SiteError(body?.message ?? `group list failed (HTTP ${res.status})`, res.status)
       }
       const routes = new Map()
       for (const [key, info] of Object.entries(body.data ?? {})) {
@@ -1727,9 +1781,11 @@ export function apply(ctx, config) {
       models: state.catalog?.total ?? -1,
       profile: state.profile,
     })
+    cancelRetry()
   }
 
   const teardown = async (message, { revoke = false } = {}) => {
+    cancelRetry()
     if (revoke) await serverLogout()
     await unsetCred(REFS.refresh)
     state.accessToken = ''
@@ -1823,6 +1879,8 @@ export function apply(ctx, config) {
       try {
         await applyGroups(username, force)
       } catch (error) {
+        // A passing failure goes to the outer handler, which retries.
+        if (isRetryableSiteError(error)) throw error
         writeAuth({ state: 'error', message: String(error?.message ?? error), user: username, groups: [] })
       }
       return
@@ -1831,7 +1889,11 @@ export function apply(ctx, config) {
     if (refreshToken) {
       try {
         await refreshSession(refreshToken)
-      } catch {
+      } catch (error) {
+        // No answer, a 5xx or a refresh race says nothing about the session:
+        // keep the cookie and leave the retry to the outer handler. Only a
+        // refusal from the site ends the session here.
+        if (isRetryableSiteError(error)) throw error
         await unsetCred(REFS.refresh)
         if (username && password) {
           try {
@@ -1872,8 +1934,14 @@ export function apply(ctx, config) {
     }).catch((error) => {
       trace('reconcile FAILED', String(error?.message ?? error).slice(0, 300))
       ctx.logger.warn('pixel-api: reconcile failed:', error)
+      // A passing site failure keeps the login and tries again later, under a
+      // fixed status text (SITE_RETRY_MESSAGE); the reason is logged above.
+      const retryable = isRetryableSiteError(error)
+      if (retryable) scheduleRetry()
       try {
-        writeAuth({ state: 'error', message: String(error?.message ?? error), user: '', groups: [] })
+        writeAuth(retryable
+          ? { state: 'error', message: SITE_RETRY_MESSAGE, user: (sectionOf().username ?? '').trim(), groups: [] }
+          : { state: 'error', message: String(error?.message ?? error), user: '', groups: [] })
       } catch {
         // Status write itself failed — nothing more this fiber can do.
       }
@@ -1887,6 +1955,16 @@ export function apply(ctx, config) {
       try {
         await refreshSession(refreshToken)
       } catch (error) {
+        // A passing failure keeps the session: report it in a code the Harness
+        // retries. AUTH is never retried, and the chat swaps its text for a
+        // generic notice.
+        if (isRetryableSiteError(error)) {
+          const code = error.status === 0 ? 'TRANSPORT' : error.status === 429 ? 'RATE_LIMIT' : 'SERVER'
+          throw new LlmError(`pixel-api: session refresh failed: ${error.message}`, code, {
+            ...(error.status >= 400 ? { status: error.status } : {}),
+            cause: error,
+          })
+        }
         throw new LlmError(`pixel-api: session refresh failed: ${error?.message ?? error}`, 'AUTH', { cause: error })
       }
       return state.accessToken

@@ -48,6 +48,7 @@ https://github.com/PIXEL-AI-API/dsh-pixel-api#v0.1.0
 
 - **密码只用一次**：登录成功后立即从本机凭据库删除，不会以明文留在磁盘上。本机只保留主站签发的登录会话令牌（相当于浏览器里的登录状态）。
 - **会话有效期约 30 天**，会自动续期；失效后需要重新输入一次密码。
+- **断网不会退出登录**：断网、主站重启或返回 5xx 时，插件保留登录状态并在后台自动重试（15 秒起，每次间隔加倍，最长 5 分钟一次），期间设置页显示「暂时连不上 PIXEL 主站，登录状态已保留，稍后自动重试」，不用重新输入密码；只有主站明确拒绝续期会话时，才需要重新登录。
 - **点「退出登录」会通知主站注销该会话**，不是只删本地记录。
 - **所有发往主站的请求拒绝重定向**，避免带凭据的请求被转发到其他地址。
 - 发往主站的数据：分组与模型列表、账号余额等账户信息；对话内容经主站转发给所选模型。插件不会上传你的本地文件或会话记录。
@@ -68,7 +69,7 @@ https://github.com/PIXEL-AI-API/dsh-pixel-api#v0.1.0
     - `PRICE_CONFIRMATION_REQUIRED`：分组倍率或模型价格上调待确认，到主站确认新价格后重发。
     - `SESSION_BLOCKED`：上游封锁了当前会话，新开会话再发；在原会话里重试会一直失败。
     - `ACCESS_DENIED`：分组拒绝该账号（被拉黑、暂未开放等），按主站给的原因处理，或联系分组。这类 403 不报 `AUTH`：Harness 聊天界面遇到 `AUTH` 只显示通用提示，看不到主站给的原因。
-    - `AUTH`：只在登录确实失效时出现（刷新会话后主站仍回 401），到设置页重新登录。
+    - `AUTH`：只在登录确实失效时出现（主站拒绝续期会话，或续期后主站仍回 401），到设置页重新登录。续期时连不上主站或主站出错不算失效，按 `TRANSPORT`、`SERVER`、`RATE_LIMIT` 报告并自动重试。
     - `CONTEXT_WINDOW_EXCEEDED`：超出上下文，主站把上游原文透传出来时也能识别，Harness 会尝试压缩后重试一次。
     - `CONTENT_REFUSED`：上游按内容安全策略拒绝（`finish_reason: content_filter` 或主站的内容策略错误），与 Harness 0.2.2-rc.4 起 DeepSeek 拒答的错误码一致。
     - `INVALID_REQUEST`：其余请求错误（400、413 等），主站原文照常显示。
@@ -86,7 +87,7 @@ https://github.com/PIXEL-AI-API/dsh-pixel-api#v0.1.0
 
 不联网、不用真实账号，主站接口全部在本地模拟：
 
-- `test/check-context.mjs`：用真实的 Harness `LlmRuntime` 加载插件，检查上下文窗口声明、按模型覆盖、设置页即时修改、错误分类（HTTP 错误与流中报错帧对应的错误码、`Retry-After`、请求编号）、工具结果的发送格式（`tool` 消息、图片随后附上、空的 system 消息不发送），以及各类上游的缓存用量映射。桌面版运行时下用 `ELECTRON_RUN_AS_NODE=1 "<DeepSeek Harness.exe>" test/check-context.mjs` 运行；能直接解析 `@deepseek-ai/*` 包的环境用 `node test/check-context.mjs`。
+- `test/check-context.mjs`：用真实的 Harness `LlmRuntime` 加载插件，检查上下文窗口声明、按模型覆盖、设置页即时修改、错误分类（HTTP 错误与流中报错帧对应的错误码、`Retry-After`、请求编号）、会话续期失败的处理（连不上主站或 5xx 时保留登录并定时重试，主站明确拒绝时才退出登录）、工具结果的发送格式（`tool` 消息、图片随后附上、空的 system 消息不发送），以及各类上游的缓存用量映射。桌面版运行时下用 `ELECTRON_RUN_AS_NODE=1 "<DeepSeek Harness.exe>" test/check-context.mjs` 运行；能直接解析 `@deepseek-ai/*` 包的环境用 `node test/check-context.mjs`。
 - `test/check-update.mjs`：一键更新。用真实的 git 读本地临时仓库里的真实标签，用插件管理自带的来源校验判断更新目标，再用假的插件管理逐一模拟更新结果（更新中被移除、拒绝、需要重启、失败后恢复），不安装任何东西。运行方式同上，需要 PATH 里有 git。
 - `test/check-client.mjs`：在 vm 里执行 `client.js`，操作设置页的上下文窗口卡片（显示、校验、保存、恢复默认）和插件更新卡片（检查、确认、各状态显示）。`node test/check-client.mjs`。
 - `test/check-load.mjs`、`test/check-fallback.mjs`：配置解析与图片缩放。
