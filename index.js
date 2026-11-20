@@ -729,6 +729,51 @@ async function serializeMessages(messages, images, target) {
   return wire
 }
 
+// ---------------------------------------------------------------------------
+// Claude prompt caching. The site's chat→Claude conversion keeps cache_control
+// on a text part of system / user / assistant content and on a tool message's
+// array content, but drops it from tool definitions. So the plugin marks two
+// breakpoints — the system prompt and the last conversation message — exactly
+// as the shipped pi-ai openai-completions adapter does for anthropic upstreams,
+// and leaves tools unmarked. Only claude routes are touched.
+// ---------------------------------------------------------------------------
+
+const CACHE_CONTROL = { type: 'ephemeral' }
+
+// Add one cache breakpoint to a wire message in place. A non-empty string body
+// becomes a single text part carrying it; an array body takes it on its last
+// text part with non-empty text. Returns whether anything was marked — an
+// empty string or an array with no non-empty text (an image-only turn) marks
+// nothing, so the caller keeps looking.
+function markCacheBreakpoint(message) {
+  const content = message.content
+  if (typeof content === 'string') {
+    if (content.length === 0) return false
+    message.content = [{ type: 'text', text: content, cache_control: CACHE_CONTROL }]
+    return true
+  }
+  for (let i = content.length - 1; i >= 0; i--) {
+    const part = content[i]
+    if (part.type === 'text' && part.text.length > 0) {
+      content[i] = { ...part, cache_control: CACHE_CONTROL }
+      return true
+    }
+  }
+  return false
+}
+
+// Mark the first system message and the last user / assistant / tool message,
+// the two the Claude conversion keeps. Tools stay unmarked. Mutates `messages`.
+function markClaudeCache(messages) {
+  const system = messages.find((message) => message.role === 'system')
+  if (system !== undefined) markCacheBreakpoint(system)
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (message.role !== 'user' && message.role !== 'assistant' && message.role !== 'tool') continue
+    if (markCacheBreakpoint(message)) break
+  }
+}
+
 // `openaiReasoningReplay` is the settings switch for GPT's encrypted reasoning.
 async function serializeRequest(options, group, images, openaiReasoningReplay) {
   const messages = []
@@ -737,6 +782,8 @@ async function serializeRequest(options, group, images, openaiReasoningReplay) {
   }
   const target = { provider: options.provider, model: options.model, openaiReasoningReplay }
   messages.push(...await serializeMessages(options.messages, images, target))
+  // Claude routes get cache breakpoints; every other model's body is unchanged.
+  if (/claude/i.test(options.model)) markClaudeCache(messages)
 
   const tools = options.tools?.map((tool) => ({
     type: 'function',

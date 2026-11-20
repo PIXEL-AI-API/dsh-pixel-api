@@ -792,6 +792,85 @@ check('  ...the trimmed turn no longer matches its token: nothing goes back', pl
 config.openaiReasoningReplay?.[WRITE]?.(false)
 
 // ---------------------------------------------------------------------------
+// Claude prompt caching: on a claude route the plugin marks two cache_control
+// breakpoints the site's chat→Claude conversion keeps — the system prompt and
+// the last conversation message (new-api-main relaykit claude_messages). Tools
+// stay unmarked, and every non-claude route's body is byte-identical to before.
+log('Claude prompt caching (cache_control breakpoints)')
+const CLAUDE_ROUTE = { provider: 'pixel/room-1024', model: 'claude-opus-5-5' }
+const EPHEMERAL = { type: 'ephemeral' }
+const cachedPart = (text) => ({ type: 'text', text, cache_control: EPHEMERAL })
+// The full request body one history produced.
+const bodyOf = async (route, messages) => {
+  const before = chatBodies.length
+  await streamTo(route, () => sse([choice({ content: 'ok' }), choice({}, 'stop'), usage, '[DONE]']), messages)
+  return chatBodies.length > before ? chatBodies.at(-1) : undefined
+}
+const marks = (body) => JSON.stringify(body).split('"cache_control"').length - 1
+readImageRequest = async (ref) => ({ mediaType: 'image/png', data: Buffer.from(ref.attachmentId) })
+
+// system + user + tool-call turn + tool result: system and the trailing tool
+// message take the two breakpoints.
+let body = await bodyOf(CLAUDE_ROUTE, [systemSays('be brief'), userSays('read a'),
+  callsTools('call_a'), toolAnswers('call_a', [textBlock('contents of a')])])
+check('claude: the system prompt is marked, its text in one cached part',
+  isDeepStrictEqual(body.messages[0], { role: 'system', content: [cachedPart('be brief')] }), body.messages[0])
+check('claude: the last tool message is marked, its string body one cached part',
+  isDeepStrictEqual(body.messages.at(-1), { role: 'tool', tool_call_id: 'call_a', content: [cachedPart('contents of a')] }), body.messages.at(-1))
+check('claude: the tool-call turn between them is not marked',
+  body.messages[2].role === 'assistant' && !JSON.stringify(body.messages[2]).includes('cache_control'), body.messages[2])
+check('claude: exactly two breakpoints in the request', marks(body) === 2, marks(body))
+
+// tools are declared but never marked (the site drops cache_control there).
+body = await bodyOf({ ...CLAUDE_ROUTE, model: 'claude-opus-5-5' }, [systemSays('sys'), userSays('hi')])
+check('claude: a plain user turn takes the second breakpoint',
+  isDeepStrictEqual(body.messages.at(-1), { role: 'user', content: [cachedPart('hi')] }), body.messages.at(-1))
+const withTools = async (route) => {
+  const before = chatBodies.length
+  chat = () => sse([choice({ content: 'ok' }), choice({}, 'stop'), usage, '[DONE]'])
+  for await (const _ of llm.stream({ ...route, messages: [systemSays('sys'), userSays('hi')],
+    tools: [{ name: 'read', description: 'read', parameters: { type: 'object', properties: {} } }] })) void _
+  return chatBodies.length > before ? chatBodies.at(-1) : undefined
+}
+body = await withTools(CLAUDE_ROUTE)
+check('claude: tools are declared but carry no cache_control (still two breakpoints)',
+  Array.isArray(body.tools) && body.tools.length === 1 && marks(body) === 2
+  && !JSON.stringify(body.tools).includes('cache_control'), { tools: body.tools, marks: marks(body) })
+
+// An image-only last user message has an empty text part: skip it and mark the
+// message before it instead.
+body = await bodyOf(CLAUDE_ROUTE, [systemSays('sys'), userSays('earlier text'),
+  { role: 'user', content: [imageBlock('img-1')] }])
+check('claude: an image-only last user message (empty text) is not marked',
+  Array.isArray(body.messages.at(-1).content) && !JSON.stringify(body.messages.at(-1)).includes('cache_control'), body.messages.at(-1))
+check('claude: the breakpoint moves to the previous message',
+  isDeepStrictEqual(body.messages[1], { role: 'user', content: [cachedPart('earlier text')] }), body.messages[1])
+check('claude: still exactly two breakpoints', marks(body) === 2, marks(body))
+
+// A trailing pure tool-call assistant turn (content "") is skipped too.
+body = await bodyOf(CLAUDE_ROUTE, [systemSays('sys'), userSays('do it'), callsTools('call_a')])
+check('claude: a trailing empty-content assistant turn is skipped, the user turn is marked',
+  isDeepStrictEqual(body.messages[1], { role: 'user', content: [cachedPart('do it')] })
+  && !JSON.stringify(body.messages.at(-1)).includes('cache_control') && marks(body) === 2, body.messages)
+
+// No system message: only the last conversation message is marked.
+body = await bodyOf(CLAUDE_ROUTE, [userSays('just this')])
+check('claude without a system prompt: one breakpoint, on the last message',
+  isDeepStrictEqual(body.messages, [{ role: 'user', content: [cachedPart('just this')] }]) && marks(body) === 1, body.messages)
+
+// The trigger is case-insensitive and matches the model anywhere in its id.
+body = await bodyOf({ provider: 'pixel/default', model: 'Anthropic-Claude-Sonnet' }, [systemSays('sys'), userSays('hi')])
+check('claude match is case-insensitive and substring', marks(body) === 2, marks(body))
+
+// Every non-claude route is untouched: same history, no cache_control at all.
+body = await bodyOf(GEMINI_ROUTE, [systemSays('be brief'), userSays('read a'),
+  callsTools('call_a'), toolAnswers('call_a', [textBlock('contents of a')])])
+check('non-claude: the body carries no cache_control anywhere', !JSON.stringify(body).includes('cache_control'), body)
+check('non-claude: system and tool content stay plain strings',
+  body.messages[0].content === 'be brief' && body.messages.at(-1).content === 'contents of a', body.messages)
+readImageRequest = noImages
+
+// ---------------------------------------------------------------------------
 // A refresh the site never answered, or answered with a 5xx, says nothing
 // about the session: the request fails in a code the Harness retries and the
 // refresh cookie stays. Only the site's refusal is AUTH.
