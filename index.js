@@ -314,6 +314,10 @@ export const Config = z.object({
   // Per-model context windows keyed by an exact model id or a `prefix*`
   // pattern (case-insensitive; exact beats prefix, longer prefix wins).
   contextWindows: z.dict(z.natural()).default({}).volatile(),
+  // Sends GPT's encrypted reasoning back with each later step. Off by default:
+  // the site accepts it only from the upstream account that produced it, so a
+  // group that spreads requests over several accounts fails them.
+  openaiReasoningReplay: z.boolean().default(false).volatile(),
   // Settings page "刷新" bumps this; the host refetches profile + groups.
   refreshAt: z.number().default(0).volatile(),
   // Settings page "退出登录" bumps this; the host revokes the site session.
@@ -559,19 +563,104 @@ async function serializeToolResult(toolCallId, blocks, images) {
   return { message: { role: 'tool', tool_call_id: toolCallId, content }, attached }
 }
 
-function serializeAssistant(message) {
+// ---------------------------------------------------------------------------
+// Replay: per-response data the site hands out for later requests — Gemini
+// thought signatures and its replay token, GPT encrypted reasoning — kept on
+// the turn's finish chunk as replayState and sent back with that turn. The
+// stored content stays the authoritative record: replay data that no longer
+// fits the turn is left out and the turn goes as ordinary history, the rule
+// the shipped pi-ai adapter follows.
+// ---------------------------------------------------------------------------
+
+// The response half of the replay envelope this plugin writes; DSH stores the
+// envelope on the assistant message as source.replayState.
+const REPLAY_KIND = 'pixel-api'
+const REPLAY_VERSION = 1
+
+const isRecord = (value) => typeof value === 'object' && value !== null && !Array.isArray(value)
+const isNonEmptyString = (value) => typeof value === 'string' && value.length > 0
+
+// What replay data was issued for: the turn's text and its tool calls, the
+// content the site checks a token against. The stream's closed blocks and a
+// stored message both go through here, so the two sides hash the same thing.
+function replayDigest(blocks) {
+  const calls = blocks
+    .filter((block) => block.type === 'tool-call')
+    .map((block) => [String(block.id), block.name, block.arguments])
+  return createHash('sha256').update(JSON.stringify([flattenText(blocks), calls])).digest('hex')
+}
+
+// The finish chunk's replay envelope for one response: `blocks` are its
+// closed content blocks, the rest the replay data its stream carried;
+// undefined when it carried none. No per-block half: DSH then keeps the
+// envelope whole, and the digest ties it to the turn's content instead.
+function replayEnvelope(blocks, { openai, gemini, signatures }) {
+  const signed = Object.keys(signatures).length > 0
+  if (openai === undefined && gemini === undefined && !signed) return undefined
+  return {
+    response: {
+      kind: REPLAY_KIND,
+      version: REPLAY_VERSION,
+      digest: replayDigest(blocks),
+      ...(openai === undefined ? {} : { openai }),
+      ...(gemini === undefined ? {} : { gemini }),
+      ...(signed ? { signatures } : {}),
+    },
+  }
+}
+
+// Whether `value` is a response half this plugin version wrote. Another
+// adapter's state, another version or a damaged value is not used.
+function isReplayResponse(value) {
+  if (!isRecord(value) || value.kind !== REPLAY_KIND || value.version !== REPLAY_VERSION) return false
+  if (typeof value.digest !== 'string') return false
+  if (value.openai !== undefined && typeof value.openai !== 'string') return false
+  if (value.gemini !== undefined && typeof value.gemini !== 'string') return false
+  return value.signatures === undefined
+    || (isRecord(value.signatures) && Object.values(value.signatures).every((signature) => typeof signature === 'string'))
+}
+
+// The replay data stored on one assistant turn, when it may go back with a
+// request to `target`: the turn came from the same route and model, and it
+// still holds the text and tool calls the data was issued for. The runtime
+// hands this adapter the replay state of every route it serves, so the route
+// check is the plugin's own: another group may sit on another upstream account.
+function storedReplay(message, target) {
+  const source = message.source
+  if (source.provider !== target.provider || source.model !== target.model) return undefined
+  const response = source.replayState?.response
+  if (!isReplayResponse(response) || response.digest !== replayDigest(message.content)) return undefined
+  return response
+}
+
+// `target` is where this request goes (storedReplay).
+function serializeAssistant(message, target) {
   const text = flattenText(message.content)
   const reasoning = message.content
     .filter((block) => block.type === 'reasoning')
     .map((block) => block.text)
     .join('')
+  const replay = storedReplay(message, target)
+  const signatures = replay?.signatures ?? {}
   const toolCalls = message.content
     .filter((block) => block.type === 'tool-call')
     .map((block) => ({
       id: block.id,
       type: 'function',
       function: { name: block.name, arguments: block.arguments },
+      // A Gemini thought signature goes back on the call it signed.
+      ...(Object.hasOwn(signatures, block.id)
+        ? { extra_content: { google: { thought_signature: signatures[block.id] } } }
+        : {}),
     }))
+  // Turn-level replay data. GPT's encrypted reasoning goes only with the
+  // switch on: the site accepts it from the upstream account that produced it.
+  const extra = {
+    ...(replay?.gemini === undefined ? {} : { google: { new_api_gemini_replay: replay.gemini } }),
+    ...(replay?.openai !== undefined && target.openaiReasoningReplay
+      ? { openai: { new_api_openai_replay: replay.openai } }
+      : {}),
+  }
 
   return {
     role: 'assistant',
@@ -583,10 +672,11 @@ function serializeAssistant(message) {
     // it is ignored on plain turns, so we drop it there to save tokens.
     ...(toolCalls.length > 0 && reasoning.length > 0 ? { reasoning_content: reasoning } : {}),
     ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+    ...(Object.keys(extra).length > 0 ? { extra_content: extra } : {}),
   }
 }
 
-async function serializeMessages(messages, images) {
+async function serializeMessages(messages, images, target) {
   const wire = []
   // Images of the current run of tool results. They go out together after
   // the run: a user message between two tool messages would cut the answers
@@ -619,7 +709,7 @@ async function serializeMessages(messages, images) {
       continue
     }
     if (message.role === 'assistant') {
-      wire.push(serializeAssistant(message))
+      wire.push(serializeAssistant(message, target))
       continue
     }
     // Older runtimes carry tool results as `tool-result` blocks inside a user
@@ -639,12 +729,14 @@ async function serializeMessages(messages, images) {
   return wire
 }
 
-async function serializeRequest(options, group, images) {
+// `openaiReasoningReplay` is the settings switch for GPT's encrypted reasoning.
+async function serializeRequest(options, group, images, openaiReasoningReplay) {
   const messages = []
   if (options.system !== undefined && options.system.length > 0) {
     messages.push({ role: 'system', content: options.system })
   }
-  messages.push(...await serializeMessages(options.messages, images))
+  const target = { provider: options.provider, model: options.model, openaiReasoningReplay }
+  messages.push(...await serializeMessages(options.messages, images, target))
 
   const tools = options.tools?.map((tool) => ({
     type: 'function',
@@ -811,6 +903,10 @@ async function* translate(payloads, facts) {
   const order = []
   let pendingFinish
   let pendingUsage
+  // Turn-level replay data of this response (Replay above); thought
+  // signatures sit on their tool blocks.
+  let openaiReplay
+  let geminiReplay
 
   const open = (kind) => {
     const block = { index: nextIndex++, kind, text: '' }
@@ -833,6 +929,14 @@ async function* translate(payloads, facts) {
     }
     if (pendingUsage) yield { type: 'usage', usage: pendingUsage }
   }
+  // Built from the blocks exactly as they were closed, so the digest matches
+  // the turn DSH stores from them.
+  const replayOf = () => {
+    const blocks = order.map(closeBlock)
+    const signatures = Object.fromEntries(order.flatMap((block, position) =>
+      (block.signature === undefined ? [] : [[blocks[position].id, block.signature]])))
+    return replayEnvelope(blocks, { openai: openaiReplay, gemini: geminiReplay, signatures })
+  }
 
   for await (const payload of payloads) {
     if (payload === DONE) {
@@ -847,13 +951,13 @@ async function* translate(payloads, facts) {
           facts,
         )
       }
-      const reason = pendingFinish ?? { kind: 'stop' }
-      yield {
-        type: 'finish',
-        reason: reason.kind === 'stop' && order.length === 0
-          ? { kind: 'error', failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE, ...facts } }
-          : reason,
-      }
+      const pending = pendingFinish ?? { kind: 'stop' }
+      const reason = pending.kind === 'stop' && order.length === 0
+        ? { kind: 'error', failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE, ...facts } }
+        : pending
+      // Only a response that finished is kept for replay.
+      const replayState = reason.kind === 'error' ? undefined : replayOf()
+      yield { type: 'finish', reason, ...(replayState === undefined ? {} : { replayState }) }
       return
     }
 
@@ -882,6 +986,13 @@ async function* translate(payloads, facts) {
 
     for (const choice of chunk.choices ?? []) {
       const delta = choice.delta
+
+      // GPT's encrypted reasoning comes in a chunk of its own, the Gemini
+      // token with the finish reason; either is taken wherever it appears.
+      const openaiToken = delta?.extra_content?.openai?.new_api_openai_replay
+      if (isNonEmptyString(openaiToken)) openaiReplay = openaiToken
+      const geminiToken = delta?.extra_content?.google?.new_api_gemini_replay
+      if (isNonEmptyString(geminiToken)) geminiReplay = geminiToken
 
       const reasoning = delta?.reasoning_content
       if (typeof reasoning === 'string' && reasoning.length > 0) {
@@ -912,6 +1023,8 @@ async function* translate(payloads, facts) {
         }
         if (call.id !== undefined) block.callId = call.id
         if (call.function?.name !== undefined) block.name = call.function.name
+        const signature = call.extra_content?.google?.thought_signature
+        if (isNonEmptyString(signature)) block.signature = signature
         const fragment = call.function?.arguments ?? ''
         block.text += fragment
         yield {
@@ -1092,7 +1205,7 @@ class PixelAdapter extends LlmAdapter {
   }
 
   async *request(options, group, signal, onComment) {
-    const payload = JSON.stringify(await serializeRequest(options, group, this.deps.images()))
+    const payload = JSON.stringify(await serializeRequest(options, group, this.deps.images(), this.deps.openaiReasoningReplay()))
     let response
     // A stale access token answers 401 once: invalidate it, re-resolve the
     // session (refresh or re-login), and retry the identical payload.
@@ -1226,11 +1339,13 @@ export function apply(ctx, config) {
     }
   }
   // Read per call: the settings page commits these volatile cells in place,
-  // so a changed window applies to the next request without a fiber restart.
+  // so a changed window or replay switch applies to the next request without
+  // a fiber restart.
   const contextWindowOf = (model) => {
     const cfg = config ?? ctx.config ?? {}
     return contextWindowFor(model, Number(cell(cfg.contextWindow)), cell(cfg.contextWindows))
   }
+  const openaiReasoningReplayOf = () => cell((config ?? ctx.config ?? {}).openaiReasoningReplay) === true
 
   // Canonical auth shape: fixed key order so the dedupe compare below is a
   // plain string compare, and nothing unbounded (no group-name list) is
@@ -2119,6 +2234,7 @@ export function apply(ctx, config) {
     routes: () => state.routes,
     catalog: () => state.catalog,
     contextWindow: contextWindowOf,
+    openaiReasoningReplay: openaiReasoningReplayOf,
     groupModels,
     fallbackModels,
     images,

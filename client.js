@@ -89,6 +89,10 @@ window.__ModuleLoader__.load({
       'ctx.saving': '保存中…',
       'ctx.reset': '恢复默认',
       'ctx.saved': '已保存，下一次请求起生效。',
+      'replay.title': 'GPT 加密推理回传',
+      'replay.desc': '开启后，GPT 模型在工具调用的每一步会带回上一步的加密推理，推理更连贯。主站只认产生它的上游账号：同一分组有多个渠道、而主站没有对 /pg/chat/completions 开渠道亲和时，请求换到别的账号会失败，这个会话后面的请求也会跟着失败，关掉本开关即可恢复。确认分组只有一个渠道或主站已配置亲和后再开。',
+      'replay.on': '已开启',
+      'replay.off': '已关闭',
       'err.ctx.default': '默认窗口必须是大于 65536 的整数（Harness 压缩默认预留 65536 token）。',
       'err.ctx.line': '第 {line} 行格式不对：应为「模型 ID = token 数」，token 数须为大于 65536 的整数。',
       'err.ctx.star': '第 {line} 行：单独的 * 会覆盖所有模型，请直接修改默认窗口。',
@@ -167,6 +171,10 @@ window.__ModuleLoader__.load({
       'ctx.saving': 'Saving…',
       'ctx.reset': 'Restore defaults',
       'ctx.saved': 'Saved; applies from the next request.',
+      'replay.title': 'GPT encrypted-reasoning passback',
+      'replay.desc': "When on, GPT models carry the previous step's encrypted reasoning into each tool-calling step, for more coherent reasoning. The site accepts it only from the upstream account that produced it: if a group has several channels and the site has no channel affinity for /pg/chat/completions, a request that moves to another account fails and the rest of this session's requests fail with it — turn this switch off to recover. Turn it on only after confirming the group has a single channel, or that the site has affinity configured.",
+      'replay.on': 'On',
+      'replay.off': 'Off',
       'err.ctx.default': 'The default window must be an integer above 65536 (Harness compaction reserves 65536 tokens by default).',
       'err.ctx.line': 'Line {line} is malformed: use "model ID = tokens" with an integer above 65536.',
       'err.ctx.star': 'Line {line}: a bare * would cover every model; change the default window instead.',
@@ -780,6 +788,48 @@ window.__ModuleLoader__.load({
           font-size: 12px;
           color: var(--dsw-alias-state-success-primary, #2ea043);
         }
+
+        .pxa-switch {
+          position: relative;
+          flex-shrink: 0;
+          width: 40px;
+          height: 22px;
+          padding: 0;
+          border: none;
+          border-radius: 999px;
+          cursor: pointer;
+          background: var(--dsw-alias-border-l2, rgba(128,128,128,0.3));
+          transition: background-color .15s ease;
+        }
+
+        .pxa-switch.on {
+          background: var(--dsw-alias-button-primary-fill, #4d6bfe);
+        }
+
+        .pxa-switch:disabled {
+          opacity: 0.5;
+          cursor: not-allowed;
+        }
+
+        .pxa-switch-knob {
+          position: absolute;
+          top: 3px;
+          left: 3px;
+          width: 16px;
+          height: 16px;
+          border-radius: 50%;
+          background: #ffffff;
+          box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+          transition: transform .15s ease;
+        }
+
+        .pxa-switch.on .pxa-switch-knob { transform: translateX(18px); }
+
+        .pxa-switch-state {
+          font-size: 12px;
+          font-weight: normal;
+          color: var(--dsw-alias-label-tertiary, #81858c);
+        }
       `
       document.head.appendChild(style)
       return () => style.remove()
@@ -945,6 +995,58 @@ window.__ModuleLoader__.load({
             saved ? h('span', { className: 'pxa-saved' }, t('ctx.saved')) : null,
           ),
         ),
+      )
+    }
+
+    const SparkIcon = () => h('svg', { width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' },
+      h('path', { d: 'M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M18.4 5.6l-2.8 2.8M8.4 15.6l-2.8 2.8' })
+    )
+
+    // GPT encrypted-reasoning passback. Off by default: the host sends the
+    // site's replay token back only when this is on (index.js serializeAssistant).
+    // The toggle writes the volatile `openaiReasoningReplay` field; the host
+    // reads it live, so it applies from the next request without a reload.
+    function ReplayCard(props) {
+      const { api, t, section, reload } = props
+      const stored = !!(section && section.openaiReasoningReplay)
+      const [busy, setBusy] = useState(false)
+      const [error, setError] = useState(null)
+      // Intended value while a write is in flight; null follows the stored one.
+      const [optimistic, setOptimistic] = useState(null)
+      const on = optimistic === null ? stored : optimistic
+      useEffect(() => {
+        if (optimistic !== null && optimistic === stored) setOptimistic(null)
+      }, [stored, optimistic])
+
+      const toggle = () => {
+        if (busy) return
+        const value = !on
+        setBusy(true)
+        setError(null)
+        setOptimistic(value)
+        api.settings.mutate(NS, [{ op: 'set', path: ['openaiReasoningReplay'], value }])
+          .then(() => { if (typeof reload === 'function') void reload() },
+            (e) => { setOptimistic(null); setError(msg(e)) })
+          .finally(() => setBusy(false))
+      }
+
+      return h('div', { className: 'pxa-card' },
+        h('div', { className: 'pxa-card-head' },
+          h('div', { className: 'pxa-card-title' }, h(SparkIcon, null), t('replay.title')),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+            h('span', { className: 'pxa-switch-state' }, on ? t('replay.on') : t('replay.off')),
+            h('button', {
+              type: 'button',
+              className: 'pxa-switch' + (on ? ' on' : ''),
+              role: 'switch',
+              'aria-checked': on,
+              disabled: busy,
+              onClick: toggle,
+            }, h('span', { className: 'pxa-switch-knob' })),
+          ),
+        ),
+        h('p', { className: 'pxa-desc' }, t('replay.desc')),
+        error ? h('div', { className: 'pxa-banner err' }, error) : null,
       )
     }
 
@@ -1357,6 +1459,7 @@ window.__ModuleLoader__.load({
           ),
         ),
         h(ContextCard, { api, t, section: view.section, reload: load }),
+        h(ReplayCard, { api, t, section: view.section, reload: load }),
         updateCard,
         h('div', { className: 'pxa-footer' },
           h('span', null, groupCount > 0

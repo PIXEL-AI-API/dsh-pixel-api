@@ -1,6 +1,7 @@
 // Host-half check: declared context capacity, error classification (HTTP
-// errors and stream error frames), session refresh failures, and the wire
-// shape of tool results.
+// errors and stream error frames), session refresh failures, the wire shape
+// of tool results, and the site's replay data (capture, send-back rules, and
+// a round trip through the agent loop's own assembly).
 // Boots the real plugin module against the real LlmRuntime with a fake ctx and
 // a mocked PIXEL site — no network, no credentials, nothing billed.
 //
@@ -10,6 +11,7 @@
 //     node test/check-context.mjs [out-file]
 //
 // Exits 1 when a check fails.
+import { createHash } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -44,7 +46,8 @@ const runtimeImport = async (id, file) => {
 }
 
 const { Context } = await runtimeImport('@deepseek-ai/cordis', 'lib/index.js')
-const { LlmRuntime } = await runtimeImport('@deepseek-ai/dsh-llm', 'lib/index.js')
+const { AssistantStreamAccumulator, BlockAssembler, createAssistantMessage, LlmRuntime } = await runtimeImport('@deepseek-ai/dsh-llm', 'lib/index.js')
+const { isJsonValue } = await runtimeImport('@deepseek-ai/dsh-util-values', 'lib/index.js')
 const plugin = await import(pathToFileURL(join(here, '..', 'index.js')).href)
 const WRITE = Symbol.for('cosmokit.volatile.write')
 const read = (v) => (v && typeof v === 'object' && typeof v.get === 'function' ? v.get() : v)
@@ -54,10 +57,12 @@ log('Config')
 const defaults = plugin.Config({})
 check('default contextWindow is 272000', read(defaults.contextWindow) === 272000, read(defaults.contextWindow))
 check('default contextWindows is empty', JSON.stringify(read(defaults.contextWindows)) === '{}', read(defaults.contextWindows))
+check('default openaiReasoningReplay is false', read(defaults.openaiReasoningReplay) === false, read(defaults.openaiReasoningReplay))
 const rejects = (input) => { try { plugin.Config(input); return false } catch { return true } }
 check('rejects a non-numeric contextWindow', rejects({ contextWindow: '272k' }))
 check('rejects a fractional contextWindow', rejects({ contextWindow: 1.5 }))
 check('rejects a negative per-model window', rejects({ contextWindows: { x: -5 } }))
+check('rejects a non-boolean openaiReasoningReplay', rejects({ openaiReasoningReplay: 'yes' }))
 
 // ---------------------------------------------------------------------------
 // Mocked site. Every request must refuse redirects (index.js siteFetch).
@@ -562,6 +567,229 @@ sent = await send([userSays('read'), callsTools('call_a'), { role: 'user', conte
 check('legacy results alone add no empty user message', isDeepStrictEqual(sent.wire.slice(2), [
   wireTool('call_a', 'legacy A'),
 ]), sent)
+
+// ---------------------------------------------------------------------------
+// The site's replay data (new-api-main relaykit shared/gemini/replay.go,
+// shared/openai/replay.go, oai_responses/to_oai_chat_stream_resp.go): a Gemini
+// token in the finish chunk and thought signatures on tool calls, a GPT token
+// in a chunk of its own. It rides the finish chunk as replayState and goes
+// back with that turn only to the same group and model while the turn's text
+// and tool calls are unchanged; GPT's only with the settings switch on.
+log('Replay: capture')
+const GEMINI_ROUTE = ROUTE
+const GPT_ROUTE = { provider: 'pixel/default', model: 'gpt-6.2-sol' }
+const digestOf = (text, calls) => createHash('sha256').update(JSON.stringify([text, calls])).digest('hex')
+const finishChunk = (chunks) => chunks.findLast((c) => c.type === 'finish')
+// One request to `route` through the real runtime.
+const streamTo = async (route, responder, messages = [userSays('go')]) => {
+  chat = responder
+  const chunks = []
+  for await (const chunk of llm.stream({ ...route, messages })) chunks.push(chunk)
+  return chunks
+}
+// A Gemini tool-calling turn as the site streams it: of two parallel calls only
+// the first carries a thought signature, and the finish chunk the token.
+const geminiTurn = () => sse([
+  choice({ content: 'Reading ' }),
+  choice({ content: 'both.' }),
+  choice({ tool_calls: [{ index: 0, id: 'call_g1', type: 'function', function: { name: 'read', arguments: '{"p":' }, extra_content: { google: { thought_signature: 'sig-g1' } } }] }),
+  choice({ tool_calls: [{ index: 0, function: { arguments: '"a"}' } }] }),
+  choice({ tool_calls: [{ index: 1, id: 'call_g2', type: 'function', function: { name: 'read', arguments: '{"p":"b"}' } }] }),
+  choice({ extra_content: { google: { new_api_gemini_replay: 'gemini-token' } } }, 'tool_calls'),
+  usage, '[DONE]',
+])
+const geminiContent = [
+  textBlock('Reading both.'),
+  { type: 'tool-call', id: 'call_g1', name: 'read', arguments: '{"p":"a"}' },
+  { type: 'tool-call', id: 'call_g2', name: 'read', arguments: '{"p":"b"}' },
+]
+const geminiDigest = digestOf('Reading both.', [['call_g1', 'read', '{"p":"a"}'], ['call_g2', 'read', '{"p":"b"}']])
+const geminiReplay = {
+  response: { kind: 'pixel-api', version: 1, digest: geminiDigest, gemini: 'gemini-token', signatures: { call_g1: 'sig-g1' } },
+}
+// A GPT turn through the site's Responses conversion: the encrypted reasoning
+// token in a chunk of its own, before the finish chunk.
+const gptTurn = () => sse([
+  choice({ reasoning_content: 'Thinking.' }),
+  choice({ content: 'Checking.' }),
+  choice({ tool_calls: [{ index: 0, id: 'call_o1', type: 'function', function: { name: 'read', arguments: '{"p":"c"}' } }] }),
+  choice({ extra_content: { openai: { new_api_openai_replay: 'openai-token' } } }),
+  choice({}, 'tool_calls'), usage, '[DONE]',
+])
+const gptContent = [
+  { type: 'reasoning', text: 'Thinking.' },
+  textBlock('Checking.'),
+  { type: 'tool-call', id: 'call_o1', name: 'read', arguments: '{"p":"c"}' },
+]
+const gptReplay = {
+  response: { kind: 'pixel-api', version: 1, digest: digestOf('Checking.', [['call_o1', 'read', '{"p":"c"}']]), openai: 'openai-token' },
+}
+
+let finished = finishChunk(await streamTo(GEMINI_ROUTE, geminiTurn))
+check('Gemini: replayState holds the token, the signature by call id, and the turn digest',
+  isDeepStrictEqual(finished?.replayState, geminiReplay), finished)
+check('  ...the turn still finishes tool-calls', finished?.reason?.kind === 'tool-calls', finished?.reason)
+check('  ...the finish chunk is lossless JSON, as the agent loop requires', finished !== undefined && isJsonValue(finished), finished)
+finished = finishChunk(await streamTo(GPT_ROUTE, gptTurn))
+check('GPT: the token from its own chunk lands in replayState.response.openai',
+  isDeepStrictEqual(finished?.replayState, gptReplay), finished)
+finished = finishChunk(await streamTo(GPT_ROUTE, () => sse([choice({ content: 'plain' }), choice({}, 'stop'), usage, '[DONE]'])))
+check('no replay data -> the finish chunk has no replayState',
+  finished?.reason?.kind === 'stop' && !('replayState' in finished), finished)
+finished = finishChunk(await streamTo(GEMINI_ROUTE, () => sse([
+  choice({ content: 'plain', extra_content: { openai: { new_api_openai_replay: '' }, google: { new_api_gemini_replay: '' } } }),
+  choice({ tool_calls: [{ index: 0, id: 'call_e', type: 'function', function: { name: 'read', arguments: '{}' }, extra_content: { google: { thought_signature: '' } } }] }),
+  choice({}, 'tool_calls'), '[DONE]',
+])))
+check('empty tokens and signatures are not replay data',
+  finished?.reason?.kind === 'tool-calls' && !('replayState' in finished), finished)
+const tokenOnly = { extra_content: { google: { new_api_gemini_replay: 'gemini-token' } } }
+for (const [label, events, code] of [
+  ['an empty reply', [choice(tokenOnly, 'stop'), '[DONE]'], 'EMPTY_RESPONSE'],
+  ['an unknown finish_reason', [choice({ content: 'x', ...tokenOnly }, 'eaten'), '[DONE]'], 'UNKNOWN_FINISH_REASON'],
+]) {
+  finished = finishChunk(await streamTo(GEMINI_ROUTE, () => sse(events)))
+  check(`${label} with a token -> ${code}, no replayState`,
+    finished?.reason?.failure?.code === code && !('replayState' in finished), finished)
+}
+
+log('Replay: what goes back with a stored turn')
+const storedTurn = (route, content, replayState) => ({
+  role: 'assistant',
+  source: { kind: 'model', ...route, ...(replayState === undefined ? {} : { replayState }) },
+  content,
+})
+const geminiHistory = (turn) => [userSays('read a and b'), turn,
+  toolAnswers('call_g1', [textBlock('A')]), toolAnswers('call_g2', [textBlock('B')])]
+const gptHistory = (turn) => [userSays('read c'), turn, toolAnswers('call_o1', [textBlock('C')])]
+// One request to `route`; `assistant` is the stored turn as it reached the site.
+const sendTo = async (route, messages) => {
+  const before = chatBodies.length
+  const chunks = await streamTo(route, () => sse([choice({ content: 'ok' }), choice({}, 'stop'), usage, '[DONE]']), messages)
+  const body = chatBodies.length > before ? chatBodies.at(-1) : undefined
+  return { finish: finishOf(chunks), assistant: body?.messages.find((m) => m.role === 'assistant') }
+}
+// The turn went as ordinary history: no turn-level replay data, no signature.
+const plain = (assistant) => assistant !== undefined && !('extra_content' in assistant)
+  && (assistant.tool_calls ?? []).every((call) => !('extra_content' in call))
+const readCall = (id, args, signature) => ({
+  id,
+  type: 'function',
+  function: { name: 'read', arguments: args },
+  ...(signature === undefined ? {} : { extra_content: { google: { thought_signature: signature } } }),
+})
+
+let back = await sendTo(GEMINI_ROUTE, geminiHistory(storedTurn(GEMINI_ROUTE, geminiContent, geminiReplay)))
+check('same group, model and content: the Gemini token on the turn, the signature on the call it signed',
+  isDeepStrictEqual(back.assistant, {
+    role: 'assistant',
+    content: 'Reading both.',
+    tool_calls: [readCall('call_g1', '{"p":"a"}', 'sig-g1'), readCall('call_g2', '{"p":"b"}')],
+    extra_content: { google: { new_api_gemini_replay: 'gemini-token' } },
+  }), back.assistant)
+back = await sendTo(GEMINI_ROUTE, geminiHistory(storedTurn(GEMINI_ROUTE, geminiContent,
+  { response: { kind: 'pixel-api', version: 1, digest: geminiDigest, signatures: { call_g2: 'sig-g2' } } })))
+check('a signature goes back without a Gemini token',
+  isDeepStrictEqual(back.assistant?.tool_calls, [readCall('call_g1', '{"p":"a"}'), readCall('call_g2', '{"p":"b"}', 'sig-g2')])
+  && !('extra_content' in back.assistant), back.assistant)
+
+const gptStored = storedTurn(GPT_ROUTE, gptContent, gptReplay)
+back = await sendTo(GPT_ROUTE, gptHistory(gptStored))
+check('GPT token, switch off (the default): not sent', plain(back.assistant)
+  && back.assistant.content === 'Checking.' && back.assistant.reasoning_content === 'Thinking.', back.assistant)
+config.openaiReasoningReplay?.[WRITE]?.(true)
+back = await sendTo(GPT_ROUTE, gptHistory(gptStored))
+check('switch turned on (a live edit, no reload): the GPT token goes back on the turn', isDeepStrictEqual(back.assistant, {
+  role: 'assistant',
+  content: 'Checking.',
+  reasoning_content: 'Thinking.',
+  tool_calls: [readCall('call_o1', '{"p":"c"}')],
+  extra_content: { openai: { new_api_openai_replay: 'openai-token' } },
+}), back.assistant)
+
+// With the switch still on, so only the route and content rules hold it back.
+const notReplayed = [
+  ['Gemini turn, another model in the same group', { ...GEMINI_ROUTE, model: 'gemini-4-carbon' },
+    geminiHistory(storedTurn(GEMINI_ROUTE, geminiContent, geminiReplay))],
+  ['Gemini turn, the same model in another group', { ...GEMINI_ROUTE, provider: 'pixel/default' },
+    geminiHistory(storedTurn(GEMINI_ROUTE, geminiContent, geminiReplay))],
+  ['GPT turn, another model in the same group', { ...GPT_ROUTE, model: 'gpt-6.2-luna' }, gptHistory(gptStored)],
+  ['GPT turn, the same model in another group', { ...GPT_ROUTE, provider: 'pixel/room-1024' }, gptHistory(gptStored)],
+  ['the turn lost a tool call', GEMINI_ROUTE, [userSays('read a and b'),
+    storedTurn(GEMINI_ROUTE, geminiContent.slice(0, 2), geminiReplay), toolAnswers('call_g1', [textBlock('A')])]],
+  ['the turn text changed', GEMINI_ROUTE,
+    geminiHistory(storedTurn(GEMINI_ROUTE, [textBlock('Reading both!'), ...geminiContent.slice(1)], geminiReplay))],
+  ['a tool call argument changed', GPT_ROUTE, gptHistory(storedTurn(GPT_ROUTE,
+    [...gptContent.slice(0, 2), { type: 'tool-call', id: 'call_o1', name: 'read', arguments: '{"p":"d"}' }], gptReplay))],
+]
+for (const [label, route, messages] of notReplayed) {
+  const sentBack = await sendTo(route, messages)
+  check(`${label}: nothing goes back`, plain(sentBack.assistant), sentBack.assistant)
+}
+const damaged = [
+  ['another adapter kind (pi-ai)', { response: { kind: 'pi-ai', version: 2, api: 'openai-completions',
+    provider: GEMINI_ROUTE.provider, model: GEMINI_ROUTE.model, stopReason: 'toolUse' },
+  blocks: [{ type: 'text' }, { type: 'tool-call', thoughtSignature: 'sig-g1' }, { type: 'tool-call' }] }],
+  ['another version', { response: { ...geminiReplay.response, version: 2 } }],
+  ['no digest', { response: { kind: 'pixel-api', version: 1, gemini: 'gemini-token' } }],
+  ['a Gemini token that is not a string', { response: { ...geminiReplay.response, gemini: { token: 'gemini-token' } } }],
+  ['a GPT token that is not a string', { response: { ...geminiReplay.response, openai: 7 } }],
+  ['signatures as a list', { response: { ...geminiReplay.response, signatures: ['sig-g1'] } }],
+  ['a signature that is not a string', { response: { ...geminiReplay.response, signatures: { call_g1: 1 } } }],
+  ['no response object', 'gemini-token'],
+]
+for (const [label, replayState] of damaged) {
+  const sentBack = await sendTo(GEMINI_ROUTE, geminiHistory(storedTurn(GEMINI_ROUTE, geminiContent, replayState)))
+  check(`replayState with ${label}: nothing goes back, the request succeeds`,
+    plain(sentBack.assistant) && sentBack.finish?.kind === 'stop', sentBack)
+}
+
+log('Replay: round trip through the agent loop assembly')
+// Mirror of dsh-agent-loop agent.ts (a completed step): AssistantStreamAccumulator
+// snapshots each chunk, BlockAssembler assembles it, and the stored message
+// keeps the assembler's replayState in its model source.
+const assembleTurn = async (route, responder) => {
+  const accumulator = new AssistantStreamAccumulator()
+  const assembler = new BlockAssembler()
+  for (const chunk of await streamTo(route, responder)) {
+    assembler.push(accumulator.push({ time: Date.now(), chunk }).chunk)
+  }
+  return {
+    finish: assembler.finish,
+    replayState: assembler.replayState,
+    message: createAssistantMessage({
+      content: assembler.blocks(),
+      source: { ...route, ...(assembler.replayState !== undefined ? { replayState: assembler.replayState } : {}) },
+    }),
+  }
+}
+// A stored turn as a session reloaded from its log reads it back.
+const fromLog = (message) => JSON.parse(JSON.stringify(message))
+
+let assembled = await assembleTurn(GEMINI_ROUTE, geminiTurn)
+back = await sendTo(GEMINI_ROUTE, [userSays('go'), fromLog(assembled.message),
+  toolAnswers('call_g1', [textBlock('A')]), toolAnswers('call_g2', [textBlock('B')])])
+check('Gemini turn assembled by DSH and read back from the log: token and signature go back',
+  back.assistant?.extra_content?.google?.new_api_gemini_replay === 'gemini-token'
+  && isDeepStrictEqual(back.assistant?.tool_calls, [readCall('call_g1', '{"p":"a"}', 'sig-g1'), readCall('call_g2', '{"p":"b"}')]),
+  back.assistant)
+assembled = await assembleTurn(GPT_ROUTE, gptTurn)
+back = await sendTo(GPT_ROUTE, [userSays('go'), fromLog(assembled.message), toolAnswers('call_o1', [textBlock('C')])])
+check('GPT turn assembled by DSH (switch on): its token goes back',
+  isDeepStrictEqual(back.assistant?.extra_content, { openai: { new_api_openai_replay: 'openai-token' } }), back.assistant)
+// finish_reason length: assembly drops every tool call yet keeps the envelope.
+assembled = await assembleTurn(GEMINI_ROUTE, () => sse([
+  choice({ content: 'Reading.' }),
+  choice({ tool_calls: [{ index: 0, id: 'call_cut', type: 'function', function: { name: 'read', arguments: '{"p":"a"}' }, extra_content: { google: { thought_signature: 'sig-cut' } } }] }),
+  choice({ extra_content: { google: { new_api_gemini_replay: 'cut-token' } } }, 'length'),
+  usage, '[DONE]',
+]))
+check('finish_reason length with a tool call: DSH drops the call, keeps the envelope',
+  assembled.finish.kind === 'max-tokens' && assembled.replayState !== undefined
+  && isDeepStrictEqual(assembled.message.content, [textBlock('Reading.')]), assembled)
+back = await sendTo(GEMINI_ROUTE, [userSays('go'), fromLog(assembled.message), userSays('go on')])
+check('  ...the trimmed turn no longer matches its token: nothing goes back', plain(back.assistant), back.assistant)
+config.openaiReasoningReplay?.[WRITE]?.(false)
 
 // ---------------------------------------------------------------------------
 // A refresh the site never answered, or answered with a 5xx, says nothing

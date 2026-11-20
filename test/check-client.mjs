@@ -201,8 +201,8 @@ const props = page.options.inject()
 const t = props.t
 const zh = dicts[NS].zh
 const en = dicts[NS].en
-const missing = Object.keys(zh).filter((k) => /^(ctx|err\.ctx|upd)\./.test(k)).filter((k) => !(k in en))
-check('every ctx/upd string has an English entry', missing.length === 0, missing)
+const missing = Object.keys(zh).filter((k) => /^(ctx|err\.ctx|upd|replay)\./.test(k)).filter((k) => !(k in en))
+check('every ctx/upd/replay string has an English entry', missing.length === 0, missing)
 
 // --- drive the card ----------------------------------------------------------
 const find = (pred) => renderer.elements.find(pred)
@@ -256,6 +256,26 @@ check('restore defaults writes 272000 and no rules',
   && JSON.stringify(reset.ops.find((o) => o.path[0] === 'contextWindows')?.value) === '{}', reset)
 check('form follows the restored value', input()?.props.value === '272000' && textarea()?.props.value === '', [input()?.props.value, textarea()?.props.value])
 check('no render errors after interaction', renderer.errors.length === 0, renderer.errors)
+
+// --- the GPT encrypted-reasoning switch --------------------------------------
+log('Replay switch')
+// The knob is a span; only the button carries the pxa-switch class.
+const switchEl = () => find((el) => el.type === 'button' && cls(el).includes('pxa-switch'))
+check('replay card rendered', renderer.text.includes(t('replay.title')))
+check('switch defaults off', switchEl()?.props['aria-checked'] === false && !cls(switchEl()).split(' ').includes('on'), switchEl()?.props)
+const beforeReplay = mutations.length
+await switchEl().props.onClick()
+await renderer.settle(page.component, props)
+const replayOp = mutations.at(-1)
+check('clicking writes openaiReasoningReplay = true in one mutation',
+  mutations.length === beforeReplay + 1 && replayOp?.ns === NS && replayOp.ops.length === 1
+  && replayOp.ops[0].path[0] === 'openaiReasoningReplay' && replayOp.ops[0].value === true, replayOp)
+check('a stored true shows the switch on', switchEl()?.props['aria-checked'] === true && cls(switchEl()).split(' ').includes('on'), switchEl()?.props)
+await switchEl().props.onClick()
+await renderer.settle(page.component, props)
+check('clicking again writes false and the switch reads off',
+  mutations.at(-1)?.ops[0].value === false && switchEl()?.props['aria-checked'] === false, [mutations.at(-1), switchEl()?.props])
+check('no render errors in the replay card', renderer.errors.length === 0, renderer.errors)
 
 // --- the update card ---------------------------------------------------------
 log('Update card')

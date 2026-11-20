@@ -21,6 +21,11 @@
 # - contextWindows  per-model windows, e.g. { 'gemini-*': 1048576 }: an exact
 #                   model id or a `prefix*`, case-insensitive; both are also
 #                   editable on the settings page
+# - openaiReasoningReplay  false by default: send GPT's encrypted reasoning
+#                   (the site's new_api_openai_replay token) back with each
+#                   later step; also a toggle on the settings page. Leave off
+#                   when a group spreads requests over several upstream accounts
+#                   without channel affinity. Gemini signature replay is always on.
 # - updateCheckAt / updateApplyAt   bumped by the settings page's 插件更新 card;
 #                   the host reads release tags with git (only then) and runs
 #                   the plugin manager's update, recording the outcome in
