@@ -667,10 +667,11 @@ const REASONING_EFFORTS = [
 // SSE — minimal self-contained parser over the response body. Yields each
 // `data:` payload; returns after yielding the `[DONE]` sentinel, throws
 // STREAM_CLOSED if the body ends without it (truncation must not look like
-// success).
+// success). `facts` are the response's provider facts (its request id), which
+// every failure of that response carries.
 // ---------------------------------------------------------------------------
 
-async function* parseSse(stream, onComment) {
+async function* parseSse(stream, onComment, facts) {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
@@ -706,7 +707,7 @@ async function* parseSse(stream, onComment) {
       yield data
       if (data === DONE) return
     }
-    throw new LlmError('pixel-api: SSE stream ended without [DONE]', 'STREAM_CLOSED')
+    throw new LlmError('pixel-api: SSE stream ended without [DONE]', 'STREAM_CLOSED', facts)
   } finally {
     try {
       reader.releaseLock()
@@ -729,7 +730,7 @@ const REFUSAL_ERROR_CODES = new Set(['content_policy_violation', 'content_filter
 // Sentinel finish: the stream is ended as a CONTENT_REFUSED failure at [DONE].
 const REFUSED = Symbol('pixel-api refused')
 
-function mapFinishReason(reason) {
+function mapFinishReason(reason, facts) {
   switch (reason) {
     case 'stop':
       return { kind: 'stop' }
@@ -740,7 +741,7 @@ function mapFinishReason(reason) {
     case 'content_filter':
       return REFUSED
     default:
-      return { kind: 'error', failure: { message: `unknown finish_reason "${reason}"`, code: 'UNKNOWN_FINISH_REASON' } }
+      return { kind: 'error', failure: { message: `unknown finish_reason "${reason}"`, code: 'UNKNOWN_FINISH_REASON', ...facts } }
   }
 }
 
@@ -780,7 +781,9 @@ function mapUsage(usage) {
   }
 }
 
-async function* translate(payloads) {
+// `facts` are the response's provider facts (its request id), which every
+// failure of that response carries.
+async function* translate(payloads, facts) {
   let nextIndex = 0
   let reasoningBlock
   let textBlock
@@ -802,13 +805,18 @@ async function* translate(payloads) {
       arguments: block.text,
     }
     : { type: block.kind, text: block.text })
+  // Ahead of any terminal outcome, a failure included: end the open blocks and
+  // report the usage, so streamed output and billed usage are kept.
+  const settle = function* () {
+    for (const block of order) {
+      yield { type: 'block-end', index: block.index, block: closeBlock(block) }
+    }
+    if (pendingUsage) yield { type: 'usage', usage: pendingUsage }
+  }
 
   for await (const payload of payloads) {
     if (payload === DONE) {
-      for (const block of order) {
-        yield { type: 'block-end', index: block.index, block: closeBlock(block) }
-      }
-      if (pendingUsage) yield { type: 'usage', usage: pendingUsage }
+      yield* settle()
       // A content-filter stop is a refusal, not a completed answer: report the
       // billed usage above, then fail the attempt the way the Harness's own
       // DeepSeek adapter fails a `refusal` stop.
@@ -816,13 +824,14 @@ async function* translate(payloads) {
         throw new LlmError(
           'pixel-api: the upstream model refused to answer under its content policy (finish_reason content_filter)',
           CONTENT_REFUSED_CODE,
+          facts,
         )
       }
       const reason = pendingFinish ?? { kind: 'stop' }
       yield {
         type: 'finish',
         reason: reason.kind === 'stop' && order.length === 0
-          ? { kind: 'error', failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE } }
+          ? { kind: 'error', failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE, ...facts } }
           : reason,
       }
       return
@@ -832,7 +841,23 @@ async function* translate(payloads) {
     try {
       chunk = JSON.parse(payload)
     } catch {
-      throw new LlmError(`pixel-api: malformed SSE payload: ${payload.slice(0, 120)}`, 'MALFORMED_RESPONSE')
+      throw new LlmError(`pixel-api: malformed SSE payload: ${payload.slice(0, 120)}`, 'MALFORMED_RESPONSE', facts)
+    }
+
+    // The site ends a stream that failed after the response began with an
+    // `error` frame (an OpenAI error object, or a bare message string), with
+    // or without [DONE] after it. That frame is the attempt's outcome,
+    // classified like the HTTP error it stands for — not a truncated stream,
+    // an empty answer, or, after some text, a finished one. Only an object or
+    // a non-empty string counts: a falsy `error` field reports nothing.
+    if ((typeof chunk.error === 'object' && chunk.error !== null)
+      || (typeof chunk.error === 'string' && chunk.error.length > 0)) {
+      yield* settle()
+      const error = typeof chunk.error === 'string' ? { message: chunk.error } : chunk.error
+      const message = typeof error.message === 'string' && error.message.length > 0
+        ? error.message
+        : 'pixel-api: the site reported a stream error'
+      throw new LlmError(message, providerErrorCode(undefined, error), facts)
     }
 
     for (const choice of chunk.choices ?? []) {
@@ -878,36 +903,74 @@ async function* translate(payloads) {
         }
       }
 
-      if (typeof choice.finish_reason === 'string') pendingFinish = mapFinishReason(choice.finish_reason)
+      if (typeof choice.finish_reason === 'string') pendingFinish = mapFinishReason(choice.finish_reason, facts)
     }
 
     if (chunk.usage) pendingUsage = mapUsage(chunk.usage)
   }
 
-  throw new LlmError('pixel-api: SSE payload stream ended without [DONE]', 'STREAM_CLOSED')
+  throw new LlmError('pixel-api: SSE payload stream ended without [DONE]', 'STREAM_CLOSED', facts)
 }
 
 // ---------------------------------------------------------------------------
-// Provider error mapping.
+// Provider error mapping: one classification for HTTP errors and stream error
+// frames, in the Harness's own codes, so its retry policy repeats only what a
+// repeat can fix (EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT).
 // ---------------------------------------------------------------------------
 
+// The group's ratio or the model's price went up; not retried: every attempt fails until the user confirms it on the site.
+const PRICE_CONFIRMATION_REQUIRED_CODE = 'PRICE_CONFIRMATION_REQUIRED'
+// The upstream blocked this conversation; not retried: the same session fails every time, only a new one gets through.
+const SESSION_BLOCKED_CODE = 'SESSION_BLOCKED'
+// The site denies this account the group (blocked, outside its open hours …); not retried: a repeat is denied the same way.
+const ACCESS_DENIED_CODE = 'ACCESS_DENIED'
+// Site codes that decide the class whatever the status: a member limit answers
+// 429, yet no wait short of its reset lifts it.
+const QUOTA_ERROR_CODES = new Set(['insufficient_user_quota', 'pre_consume_token_quota_failed', 'room_member_limit_exceeded'])
+const PRICE_CHANGED_ERROR_CODES = new Set(['group_ratio_changed', 'model_price_changed'])
+
+// `status` is undefined for a stream error frame (that response was a 200).
 function providerErrorCode(status, error) {
+  const code = typeof error?.code === 'string' ? error.code : ''
+  const key = code.toLowerCase()
+  if (QUOTA_ERROR_CODES.has(key)) return QUOTA_EXCEEDED_CODE
+  if (PRICE_CHANGED_ERROR_CODES.has(key)) return PRICE_CONFIRMATION_REQUIRED_CODE
+  if (key === 'session_blocked') return SESSION_BLOCKED_CODE
+  if (key === 'access_denied') return ACCESS_DENIED_CODE
   // Classify on code, type and message together, as the runtime's classifiers
   // expect. The site tags a context overflow with code context_length_exceeded
   // but may pass the upstream's own wording through as the message (Claude
   // "prompt is too long: …", Gemini "The input token count …"), which a
   // message-only check misses — and overflow recovery keys on this code.
-  const code = typeof error?.code === 'string' ? error.code : ''
   const detail = [code, error?.type, error?.message]
     .filter((part) => typeof part === 'string' && part.length > 0)
     .join(' ')
   if (isQuotaExceededError(detail)) return QUOTA_EXCEEDED_CODE
   if (isContextWindowExceededError(detail)) return CONTEXT_WINDOW_EXCEEDED_CODE
-  if (REFUSAL_ERROR_CODES.has(code.toLowerCase())) return CONTENT_REFUSED_CODE
-  if (status === 401 || status === 403) return 'AUTH'
+  if (REFUSAL_ERROR_CODES.has(key)) return CONTENT_REFUSED_CODE
+  if (status === undefined) {
+    // The frame's type is all that tells a passing failure from a request the
+    // site would refuse again.
+    if (error?.type === 'rate_limit_error') return 'RATE_LIMIT'
+    if (error?.type === 'invalid_request_error') return 'INVALID_REQUEST'
+    return 'SERVER'
+  }
+  if (status === 401) return 'AUTH'
+  // The chat surface blanks an AUTH failure's text, so only a dead login may
+  // claim it; any other 403 is the site refusing this account something.
+  if (status === 403) return ACCESS_DENIED_CODE
   if (status === 429) return 'RATE_LIMIT'
-  if (status >= 500) return 'PROVIDER_ERROR'
-  return 'BAD_REQUEST'
+  if (status >= 500) return 'SERVER'
+  return 'INVALID_REQUEST'
+}
+
+// A Retry-After header as the delay the site asks for: delay-seconds, or an
+// HTTP date still ahead. Anything else asks for nothing, leaving the
+// Harness's own backoff in charge.
+function retryAfterMs(header) {
+  if (header === null) return undefined
+  const ms = /^\d+$/.test(header) ? Number(header) * 1000 : Date.parse(header) - Date.now()
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1101,10 @@ class PixelAdapter extends LlmAdapter {
       break
     }
 
+    // Every failure of this response names the site's request id, the key to
+    // the matching entry in the site's logs.
+    const requestId = response.headers.get('x-oneapi-request-id')
+    const facts = requestId ? { requestId } : {}
     if (!response.ok) {
       let message = `pixel-api: site error (HTTP ${response.status})`
       let providerError
@@ -1049,12 +1116,25 @@ class PixelAdapter extends LlmAdapter {
       } catch {
         // Only swallow error-body parsing: the HTTP status still identifies the failure.
       }
-      throw new LlmError(message, providerErrorCode(response.status, providerError), { status: response.status })
+      const delay = retryAfterMs(response.headers.get('retry-after'))
+      throw new LlmError(message, providerErrorCode(response.status, providerError), {
+        status: response.status,
+        ...(delay === undefined ? {} : { providerRetryAfterMs: delay }),
+        ...facts,
+      })
     }
     if (!response.body) {
-      throw new LlmError('pixel-api: site returned no response body', 'EMPTY_RESPONSE')
+      throw new LlmError('pixel-api: site returned no response body', 'EMPTY_RESPONSE', facts)
     }
-    yield* translate(parseSse(response.body, onComment))
+    try {
+      yield* translate(parseSse(response.body, onComment, facts), facts)
+    } catch (error) {
+      // A body read that dies mid-stream is a transport failure of this
+      // response, so it keeps the request id. Aborts pass through untouched:
+      // stream() tells a timeout from a cancel by the signals.
+      if (error instanceof LlmError || signal.aborted) throw error
+      throw new LlmError(`pixel-api: stream to ${SITE} failed`, 'TRANSPORT', { cause: error, ...facts })
+    }
   }
 }
 
@@ -1867,7 +1947,7 @@ export function apply(ctx, config) {
           if (!body?.success) {
             throw new LlmError(
               `pixel-api: model list for group "${group}" failed: ${body?.message ?? `HTTP ${res.status}`}`,
-              res.status === 401 ? 'AUTH' : 'PROVIDER_ERROR',
+              res.status === 401 ? 'AUTH' : 'SERVER',
             )
           }
           const list = Array.isArray(body.data) ? body.data : []

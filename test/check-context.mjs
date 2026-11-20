@@ -1,5 +1,5 @@
-// Host-half check: declared context capacity, refusal and overflow mapping,
-// and the wire shape of tool results.
+// Host-half check: declared context capacity, error classification (HTTP
+// errors and stream error frames), and the wire shape of tool results.
 // Boots the real plugin module against the real LlmRuntime with a fake ctx and
 // a mocked PIXEL site — no network, no credentials, nothing billed.
 //
@@ -65,7 +65,7 @@ const chatBodies = []
 let chat = () => { throw new Error('no chat responder') }
 const json = (body, status = 200, headers = {}) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } })
-const sse = (events) => new Response(new ReadableStream({
+const sse = (events, headers = {}) => new Response(new ReadableStream({
   start(controller) {
     const encoder = new TextEncoder()
     for (const event of events) {
@@ -73,7 +73,7 @@ const sse = (events) => new Response(new ReadableStream({
     }
     controller.close()
   },
-}), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+}), { status: 200, headers: { 'content-type': 'text/event-stream', ...headers } })
 let redirectViolations = 0
 globalThis.fetch = async (url, init = {}) => {
   const target = new URL(String(url))
@@ -251,7 +251,7 @@ chunks = await run(() => sse([choice({ content: 'partial' }), choice({}, 'conten
 check('content_filter fails CONTENT_REFUSED', finishOf(chunks)?.kind === 'error' && finishOf(chunks)?.failure?.code === 'CONTENT_REFUSED', finishOf(chunks))
 check('usage reported before the refusal', chunks.some((c) => c.type === 'usage'))
 
-const httpError = (status, error) => () => json({ error }, status)
+const httpError = (status, error, headers) => () => json({ error }, status, headers)
 chunks = await run(httpError(400, { code: 'context_length_exceeded', type: 'invalid_request_error', message: 'prompt is too long: 210000 tokens > 200000 maximum (request id: r1)' }))
 check('passed-through Claude overflow -> CONTEXT_WINDOW_EXCEEDED', finishOf(chunks)?.failure?.code === 'CONTEXT_WINDOW_EXCEEDED', finishOf(chunks))
 chunks = await run(httpError(400, { code: 'context_length_exceeded', type: 'invalid_request_error', message: 'The input token count (1200000) exceeds the maximum number of tokens allowed (1048576). (request id: r2)' }))
@@ -261,7 +261,112 @@ check('site-normalized overflow -> CONTEXT_WINDOW_EXCEEDED', finishOf(chunks)?.f
 chunks = await run(httpError(400, { code: 'content_policy_violation', type: 'invalid_request_error', message: 'The request was rejected by the content policy. (request id: r4)' }))
 check('content policy rejection -> CONTENT_REFUSED', finishOf(chunks)?.failure?.code === 'CONTENT_REFUSED', finishOf(chunks))
 chunks = await run(httpError(400, { code: 'invalid_request', type: 'invalid_request_error', message: 'bad parameter (request id: r5)' }))
-check('ordinary 400 stays BAD_REQUEST', finishOf(chunks)?.failure?.code === 'BAD_REQUEST', finishOf(chunks))
+check('ordinary 400 -> INVALID_REQUEST', finishOf(chunks)?.failure?.code === 'INVALID_REQUEST', finishOf(chunks))
+
+// ---------------------------------------------------------------------------
+// The Harness retries only EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT and
+// TRANSPORT by default, and its chat blanks the text of an AUTH failure: each
+// site error must land on the code that says whether to wait or what to fix.
+log('Error classification: HTTP errors')
+const REQUEST_ID = '2026112011520347100389412'
+const withRequestId = { 'x-oneapi-request-id': REQUEST_ID }
+// Every key of `expected` must match the failure (undefined: must be absent).
+const failureMatches = (failure, expected) => failure !== undefined
+  && Object.entries(expected).every(([key, value]) => failure[key] === value)
+const siteError = (code, type, message) => ({ message, type, code, param: '' })
+const rateLimited = siteError('rate_limit_exceeded', 'rate_limit_error', '上游服务繁忙，请稍后重试。')
+const httpCases = [
+  ['503 service_unavailable -> SERVER, with its status and request id', 503,
+    siteError('service_unavailable', 'server_error', '服务暂时不可用，请稍后重试。'),
+    { code: 'SERVER', status: 503, requestId: REQUEST_ID }, withRequestId],
+  ['502 -> SERVER (no request id header, none reported)', 502,
+    siteError('server_error', 'server_error', '上游服务异常，请稍后重试。'), { code: 'SERVER', status: 502, requestId: undefined }],
+  ['503 session_blocked -> SESSION_BLOCKED', 503,
+    siteError('session_blocked', 'server_error', '该会话已被上游限制，请新建会话后再发起请求，不要在原来的会话上重试。'),
+    { code: 'SESSION_BLOCKED', status: 503 }],
+  ['429 rate_limit_exceeded + Retry-After: 7 -> RATE_LIMIT after 7000 ms', 429, rateLimited,
+    { code: 'RATE_LIMIT', status: 429, providerRetryAfterMs: 7000 }, { 'retry-after': '7' }],
+  ['429 room_member_limit_exceeded -> QUOTA, not a rate limit', 429,
+    siteError('room_member_limit_exceeded', 'new_api_error', '你在该分组今日的额度已用完'), { code: 'QUOTA', status: 429 }],
+  ['403 insufficient_user_quota -> QUOTA', 403,
+    siteError('insufficient_user_quota', 'new_api_error', '用户额度不足, 剩余额度: ¥0.01'), { code: 'QUOTA', status: 403 }],
+  ['403 group_ratio_changed -> PRICE_CONFIRMATION_REQUIRED', 403,
+    siteError('group_ratio_changed', 'new_api_error', '分组倍率已上调，请到主站确认后继续使用'), { code: 'PRICE_CONFIRMATION_REQUIRED' }],
+  ['403 model_price_changed -> PRICE_CONFIRMATION_REQUIRED', 403,
+    siteError('model_price_changed', 'new_api_error', '模型价格已上调，请到主站确认后继续使用'), { code: 'PRICE_CONFIRMATION_REQUIRED' }],
+  ['403 access_denied -> ACCESS_DENIED, not AUTH', 403,
+    siteError('access_denied', 'new_api_error', '该分组暂未开放'), { code: 'ACCESS_DENIED', status: 403 }],
+]
+for (const [label, status, error, expected, headers] of httpCases) {
+  const failure = finishOf(await run(httpError(status, error, headers)))?.failure
+  check(label, failureMatches(failure, { message: error.message, ...expected }), failure)
+}
+const sentBefore401 = chatBodies.length
+const failure401 = finishOf(await run(httpError(401, siteError('', 'new_api_error', '未登录或登录已过期'))))?.failure
+check('401 again after the session refresh -> AUTH', failureMatches(failure401, { code: 'AUTH', status: 401 })
+  && chatBodies.length - sentBefore401 === 2, { failure401, requests: chatBodies.length - sentBefore401 })
+
+const retryAfterOf = async (header) => finishOf(await run(httpError(429, rateLimited, { 'retry-after': header })))?.failure
+const ahead = await retryAfterOf(new Date(Date.now() + 60_000).toUTCString())
+check('Retry-After as a future HTTP date -> the delay until then',
+  ahead?.providerRetryAfterMs > 50_000 && ahead?.providerRetryAfterMs <= 60_000, ahead)
+for (const [label, header] of [['a past HTTP date', new Date(Date.now() - 60_000).toUTCString()], ['0', '0'], ['not a delay', 'soon']]) {
+  const failure = await retryAfterOf(header)
+  check(`Retry-After ${label} asks for no delay`, failureMatches(failure, { code: 'RATE_LIMIT', providerRetryAfterMs: undefined }), failure)
+}
+
+// ---------------------------------------------------------------------------
+// After the response began, the site reports a failure as an `error` frame in
+// the stream, with or without [DONE] after it (new-api-main
+// relay/helper/stream_failure.go EndStreamWithError).
+log('Error classification: stream error frames')
+const serverFrame = { error: siteError('server_error', 'server_error', '上游服务异常，请稍后重试。') }
+const streamCases = [
+  ['text, then a server_error frame without [DONE] -> SERVER, site text kept',
+    [choice({ content: 'partial' }), serverFrame], { code: 'SERVER', message: serverFrame.error.message, status: undefined }],
+  ['the same with [DONE] after the frame -> SERVER, not a finished answer',
+    [choice({ content: 'partial' }), serverFrame, '[DONE]'], { code: 'SERVER' }],
+  ['rate_limit_error frame before any text, then [DONE] -> RATE_LIMIT, not EMPTY_RESPONSE',
+    [{ error: rateLimited }, '[DONE]'], { code: 'RATE_LIMIT' }],
+  ['context_length_exceeded frame -> CONTEXT_WINDOW_EXCEEDED',
+    [{ error: siteError('context_length_exceeded', 'invalid_request_error', "The input exceeds the model's context window. Please shorten the input and try again.") }, '[DONE]'],
+    { code: 'CONTEXT_WINDOW_EXCEEDED' }],
+  ['insufficient_user_quota frame -> QUOTA',
+    [{ error: siteError('insufficient_user_quota', 'new_api_error', '用户额度不足, 剩余额度: ¥0.00') }], { code: 'QUOTA' }],
+  ['a bare string error -> SERVER with that text', [{ error: 'upstream stream aborted' }],
+    { code: 'SERVER', message: 'upstream stream aborted' }],
+  ['an error without text -> SERVER with a fallback text', [{ error: { type: 'server_error' } }],
+    { code: 'SERVER', message: 'pixel-api: the site reported a stream error' }],
+]
+for (const [label, events, expected] of streamCases) {
+  const failure = finishOf(await run(() => sse(events)))?.failure
+  check(label, failureMatches(failure, expected), failure)
+}
+chunks = await run(() => sse([choice({ content: 'partial' }), usage, serverFrame]))
+check('usage that arrived before the error frame is still reported',
+  chunks.some((c) => c.type === 'usage' && c.usage.inputTokens === 12) && finishOf(chunks)?.failure?.code === 'SERVER', chunks)
+check('text streamed before the error frame is closed, not dropped',
+  chunks.some((c) => c.type === 'block-end' && c.block.text === 'partial'), chunks)
+chunks = await run(() => sse([{ ...choice({ content: 'fine' }), error: false }, choice({}, 'stop'), '[DONE]']))
+check('a falsy error field is not an error frame', finishOf(chunks)?.kind === 'stop', finishOf(chunks))
+
+// Every failure of one response names the site's request id.
+const requestIdCases = [
+  ['stream error frame', () => sse([serverFrame], withRequestId), 'SERVER'],
+  ['truncated stream without an error frame', () => sse([choice({ content: 'cut off' })], withRequestId), 'STREAM_CLOSED'],
+  ['malformed payload', () => sse(['{"choices": [', '[DONE]'], withRequestId), 'MALFORMED_RESPONSE'],
+  ['completed with no content', () => sse([choice({}, 'stop'), '[DONE]'], withRequestId), 'EMPTY_RESPONSE'],
+  ['unknown finish_reason', () => sse([choice({ content: 'x' }, 'eaten'), '[DONE]'], withRequestId), 'UNKNOWN_FINISH_REASON'],
+  ['content_filter stop', () => sse([choice({ content: 'x' }, 'content_filter'), '[DONE]'], withRequestId), 'CONTENT_REFUSED'],
+  ['no response body', () => new Response(null, { status: 200, headers: withRequestId }), 'EMPTY_RESPONSE'],
+  ['body read dying mid-stream', () => new Response(new ReadableStream({
+    start(controller) { controller.error(new TypeError('terminated')) },
+  }), { status: 200, headers: { 'content-type': 'text/event-stream', ...withRequestId } }), 'TRANSPORT'],
+]
+for (const [label, responder, code] of requestIdCases) {
+  const failure = finishOf(await run(responder))?.failure
+  check(`${label} -> ${code} with the request id`, failureMatches(failure, { code, requestId: REQUEST_ID }), failure)
+}
 
 // ---------------------------------------------------------------------------
 // Usage: the site's OpenAI-shaped usage per upstream family (new-api-main

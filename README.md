@@ -61,7 +61,19 @@ https://github.com/PIXEL-AI-API/dsh-pixel-api#v0.1.0
 - **推理等级**：模型菜单底部提供 `Minimal / Low / Medium / High / Xhigh / Max` 六档，选中后以 `reasoning_effort` 字段发给主站，由主站转换成各上游模型的格式（Claude 的 `output_config.effort`、Gemini 的 `thinkingConfig`、OpenAI 直传）。**不选则不发该字段**，由上游使用自己的默认强度。各分组背后的实际模型由主站决定，因此档位对所有分组统一显示；不支持思考的模型由上游自行报错。
 - **上下文窗口**：插件为每个 PIXEL 模型向 Harness 声明上下文窗口，Harness 据此决定何时自动压缩历史，以及会话中途能否切换到该模型。主站不提供各模型的实际上限，**默认按 272,000 token 计算**；在 **设置 → PIXEL API → 上下文窗口** 可以改默认值，也可以按模型单独设置（每行 `模型 ID = token 数`，以 `*` 结尾按前缀匹配，如 `gemini-* = 1048576`；精确 ID 优先，较长前缀优先，不区分大小写），从下一次请求起生效。窗口必须大于 65,536（Harness 压缩默认预留的余量），否则切换到该模型仍会被拒绝。宁可设小：设大了，历史超出上游真实上限时请求会失败。
 - **用量与缓存**：按主站返回的 `prompt_tokens_details` 分别记录缓存读取、缓存写入和未命中的输入，客户端的缓存命中率由此计算；0.2.2 及更早版本把缓存一律记为 0，客户端总显示 0%。已经记录的历史轮次不会改变，从更新后的请求开始生效。
-- **错误分类**：上游超出上下文时报 `CONTEXT_WINDOW_EXCEEDED`，主站把上游原文透传出来时也能识别，Harness 会尝试压缩后重试一次；上游按内容安全策略拒绝时（`finish_reason: content_filter` 或主站的内容策略错误）报 `CONTENT_REFUSED`，与 Harness 0.2.2-rc.4 起 DeepSeek 拒答的错误码一致。
+- **错误分类**：主站和上游的错误按 Harness 的错误码上报，Harness 据此决定要不要自动重试：
+  - **自动重试**（Harness 默认最多 5 次，间隔逐次加长）：`SERVER`（主站或上游 5xx：服务不可用、过载、超时、网关错误）、`RATE_LIMIT`（429 限流；主站带了 `Retry-After` 就按它等待，要求等待超过 10 秒时不自动重试，稍后手动重发即可）、`EMPTY_RESPONSE`（上游回了空回复），以及连不上主站（`TRANSPORT`）、流长时间没有数据（`TIMEOUT`）。
+  - **不重试，需要你处理**：
+    - `QUOTA`：钱包余额不足时去充值；分组单人每日或总额度、次数用完时（`room_member_limit_exceeded`，虽是 429，等一会儿也不会恢复），等额度重置或联系分组。
+    - `PRICE_CONFIRMATION_REQUIRED`：分组倍率或模型价格上调待确认，到主站确认新价格后重发。
+    - `SESSION_BLOCKED`：上游封锁了当前会话，新开会话再发；在原会话里重试会一直失败。
+    - `ACCESS_DENIED`：分组拒绝该账号（被拉黑、暂未开放等），按主站给的原因处理，或联系分组。这类 403 不报 `AUTH`：Harness 聊天界面遇到 `AUTH` 只显示通用提示，看不到主站给的原因。
+    - `AUTH`：只在登录确实失效时出现（刷新会话后主站仍回 401），到设置页重新登录。
+    - `CONTEXT_WINDOW_EXCEEDED`：超出上下文，主站把上游原文透传出来时也能识别，Harness 会尝试压缩后重试一次。
+    - `CONTENT_REFUSED`：上游按内容安全策略拒绝（`finish_reason: content_filter` 或主站的内容策略错误），与 Harness 0.2.2-rc.4 起 DeepSeek 拒答的错误码一致。
+    - `INVALID_REQUEST`：其余请求错误（400、413 等），主站原文照常显示。
+  - **流中报错同样识别**：回复已经开始输出、主站才在流里报错时（`error` 帧，后面带不带 `[DONE]` 都一样），按上面同样分类，不会被当成连接中断（`STREAM_CLOSED`）、空回复或正常结束；已输出的内容和用量照常记录。
+  - 每个失败都带主站的请求编号（响应头 `X-Oneapi-Request-Id`，记在错误的 `requestId` 里），反馈问题时提供它，便于在主站日志里定位。
 
 ## 限制
 
@@ -74,7 +86,7 @@ https://github.com/PIXEL-AI-API/dsh-pixel-api#v0.1.0
 
 不联网、不用真实账号，主站接口全部在本地模拟：
 
-- `test/check-context.mjs`：用真实的 Harness `LlmRuntime` 加载插件，检查上下文窗口声明、按模型覆盖、设置页即时修改、拒答与超长错误的分类、工具结果的发送格式（`tool` 消息、图片随后附上、空的 system 消息不发送），以及各类上游的缓存用量映射。桌面版运行时下用 `ELECTRON_RUN_AS_NODE=1 "<DeepSeek Harness.exe>" test/check-context.mjs` 运行；能直接解析 `@deepseek-ai/*` 包的环境用 `node test/check-context.mjs`。
+- `test/check-context.mjs`：用真实的 Harness `LlmRuntime` 加载插件，检查上下文窗口声明、按模型覆盖、设置页即时修改、错误分类（HTTP 错误与流中报错帧对应的错误码、`Retry-After`、请求编号）、工具结果的发送格式（`tool` 消息、图片随后附上、空的 system 消息不发送），以及各类上游的缓存用量映射。桌面版运行时下用 `ELECTRON_RUN_AS_NODE=1 "<DeepSeek Harness.exe>" test/check-context.mjs` 运行；能直接解析 `@deepseek-ai/*` 包的环境用 `node test/check-context.mjs`。
 - `test/check-update.mjs`：一键更新。用真实的 git 读本地临时仓库里的真实标签，用插件管理自带的来源校验判断更新目标，再用假的插件管理逐一模拟更新结果（更新中被移除、拒绝、需要重启、失败后恢复），不安装任何东西。运行方式同上，需要 PATH 里有 git。
 - `test/check-client.mjs`：在 vm 里执行 `client.js`，操作设置页的上下文窗口卡片（显示、校验、保存、恢复默认）和插件更新卡片（检查、确认、各状态显示）。`node test/check-client.mjs`。
 - `test/check-load.mjs`、`test/check-fallback.mjs`：配置解析与图片缩放。
