@@ -375,6 +375,10 @@ class SiteError extends Error {
   }
 }
 const isRetryableSiteError = (error) => error instanceof SiteError && error.retryable
+// The site could not be reached, or stopped answering mid-call: status 0.
+// describeFailure turns a TimeoutError into 连接超时.
+const siteUnreachable = (reason, cause) =>
+  new SiteError(`连不上 PIXEL 主站：${describeFailure(reason)}`, 0, { cause })
 const NS = 'pixel-api'
 const ROUTE_PREFIX = 'pixel/'
 const REFRESH_COOKIE = 'new_api_refresh'
@@ -434,6 +438,9 @@ const ACCESS_REFRESH_MARGIN_MS = 60_000
 const DONE = '[DONE]'
 // Bound each per-group model lookup so one slow group cannot stall the picker.
 const GROUP_MODELS_TIMEOUT_MS = 15_000
+// Bound every other site API call (body read included): undici's default
+// 300 s waits would let one stuck call hold the serial reconcile queue for minutes.
+const SITE_API_TIMEOUT_MS = 20_000
 // A failed per-group lookup is not retried until this cooldown elapses.
 const GROUP_FAILURE_COOLDOWN_MS = 3 * 60_000
 // Without the pricing catalog, per-group lookups are allowed only when the
@@ -460,7 +467,8 @@ function formatQuota(quota, display) {
   return '$' + units.toFixed(2)
 }
 
-// Failed password logins back off exponentially: 1m, 2m, 4m … capped at 30m.
+// Password logins the site answered with a failure back off exponentially:
+// 1m, 2m, 4m … capped at 30m (an unreachable site is not counted, see loginFlow).
 const LOGIN_BACKOFF_BASE_MS = 60_000
 const LOGIN_BACKOFF_MAX_MS = 30 * 60_000
 // After a passing site failure, reconcile retries on a delay that doubles from
@@ -1668,24 +1676,42 @@ export function apply(ctx, config) {
   }
 
   const apiJson = async (path, init) => {
+    // One timer bounds the whole call, body read included. A caller's own
+    // signal is merged in, never silently replaced by the timer.
+    const timeout = AbortSignal.timeout(SITE_API_TIMEOUT_MS)
+    const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout
     let res
     try {
       res = await siteFetch(`${SITE}${path}`, {
         ...init,
         headers: { ...attributionHeaders(), ...init?.headers },
+        signal,
       })
     } catch (error) {
       // undici reports every network failure as "fetch failed" and keeps the
-      // reason (DNS, refused, reset, TLS) in `cause`.
-      throw new SiteError(`连不上 PIXEL 主站：${describeFailure(error?.cause ?? error)}`, 0, { cause: error })
+      // reason (DNS, refused, reset, TLS) in `cause`; a timeout rejects with
+      // the signal's own TimeoutError.
+      throw siteUnreachable(error?.cause ?? error, error)
     }
-    const body = await res.json().catch(() => null)
+    let body = null
+    try {
+      body = await res.json()
+    } catch (error) {
+      // A body that is not JSON (a gateway's HTML page) stays null for the
+      // caller to report with the status. One the timer cut off is the site
+      // not answering — the same failure as a timed-out connect, never a
+      // misleading "HTTP 200" or a refusal.
+      if (timeout.aborted) throw siteUnreachable(timeout.reason, error)
+    }
     return { res, body }
   }
 
-  // Login backoff: a failed password login blocks further automatic attempts
-  // for the SAME username+password (compared by hash, never stored in clear)
-  // with exponential delay. Changing the password or username resets it.
+  // Login backoff: a password login the site answered with a failure (a
+  // refusal, a non-JSON 5xx page) blocks further automatic attempts for the
+  // SAME username+password (compared by hash, never stored in clear) with
+  // exponential delay. A site that could not be reached (SiteError status 0,
+  // a timeout included) is not counted: it says nothing about the password.
+  // Changing the password or username resets it.
   const loginGuard = { key: '', failures: 0, until: 0 }
   const loginKey = (username, password) =>
     createHash('sha256').update(`${username}\u0000${password}`).digest('hex')
@@ -1708,9 +1734,11 @@ export function apply(ctx, config) {
       loginGuard.failures = 0
       loginGuard.until = 0
     } catch (error) {
-      loginGuard.failures++
-      const delay = Math.min(LOGIN_BACKOFF_BASE_MS * 2 ** (loginGuard.failures - 1), LOGIN_BACKOFF_MAX_MS)
-      loginGuard.until = Date.now() + delay
+      if (!(error instanceof SiteError && error.status === 0)) {
+        loginGuard.failures++
+        const delay = Math.min(LOGIN_BACKOFF_BASE_MS * 2 ** (loginGuard.failures - 1), LOGIN_BACKOFF_MAX_MS)
+        loginGuard.until = Date.now() + delay
+      }
       throw error
     } finally {
       // The password is consumed by exactly one sign-in and never kept: the
@@ -1779,6 +1807,7 @@ export function apply(ctx, config) {
         referer: `${SITE}/`,
         ...attributionHeaders(),
       },
+      signal: AbortSignal.timeout(SITE_API_TIMEOUT_MS),
     }).then(
       (res) => trace('serverLogout', { http: res.status }),
       (error) => trace('serverLogout FAILED', String(error?.message ?? error).slice(0, 200)),

@@ -1,7 +1,8 @@
 // Host-half check: declared context capacity, error classification (HTTP
-// errors and stream error frames), session refresh failures, the wire shape
-// of tool results, and the site's replay data (capture, send-back rules, and
-// a round trip through the agent loop's own assembly).
+// errors and stream error frames), session refresh failures, site call
+// timeouts, the wire shape of tool results, and the site's replay data
+// (capture, send-back rules, and a round trip through the agent loop's own
+// assembly).
 // Boots the real plugin module against the real LlmRuntime with a fake ctx and
 // a mocked PIXEL site — no network, no credentials, nothing billed.
 //
@@ -80,16 +81,60 @@ const sse = (events, headers = {}) => new Response(new ReadableStream({
     controller.close()
   },
 }), { status: 200, headers: { 'content-type': 'text/event-stream', ...headers } })
+// The site's session bundle: what a refresh, a login and a 2FA check return.
+const sessionBundle = () => ({
+  access_token: 'mock-access-token',
+  access_expires_at: Math.floor(Date.now() / 1000) + 3600,
+  session: { sid: 'sid-1' },
+  user: { username: 'tester' },
+})
+// A site that stops answering, the way undici reports it: the request (or,
+// once its headers arrived, the body read) fails with the reason of the signal
+// the caller passed, when that signal fires. A request without a signal would
+// hang for good, so it fails after 2 s with NO_SIGNAL instead: the check that
+// expects a timeout reports it, and the run still ends. How each one ended is
+// recorded in stuckRequests.
+const NO_SIGNAL = 'mock site: the request carried no abort signal'
+const stuckRequests = []
+const whenStuck = (path, init, fail) => {
+  const record = { path, ended: '' }
+  stuckRequests.push(record)
+  const end = (reason) => {
+    record.ended = reason?.name === 'TimeoutError' ? 'timeout' : String(reason?.message ?? reason)
+    fail(reason)
+  }
+  const { signal } = init
+  if (!(signal instanceof AbortSignal)) {
+    // 2 s is under the 10 s threshold of the timer hold further down.
+    setTimeout(() => end(new Error(NO_SIGNAL)), 2_000)
+  } else if (signal.aborted) {
+    end(signal.reason)
+  } else {
+    signal.addEventListener('abort', () => end(signal.reason), { once: true })
+  }
+}
+const hang = (path, init) => new Promise((_, reject) => whenStuck(path, init, reject))
+const stalledBody = (path, init) => new Response(new ReadableStream({
+  start(controller) {
+    controller.enqueue(new TextEncoder().encode('{"success":true,"data":{'))
+    whenStuck(path, init, (reason) => controller.error(reason))
+  },
+}), { status: 200, headers: { 'content-type': 'application/json' } })
 // Session refresh outcome, switched per case. The failures are the site's own
 // shapes (new-api-main controller/auth_session.go writeAuthSessionError) and
-// what undici throws when the site cannot be reached.
+// what undici throws when the site cannot be reached; 'hang' never answers,
+// 'stall' sends its headers and part of the body, then nothing more.
 let refreshMode = 'ok'
-const refreshReply = () => {
+const refreshReply = (init) => {
   switch (refreshMode) {
     case 'network':
       throw new TypeError('fetch failed', {
         cause: Object.assign(new Error('getaddrinfo ENOTFOUND api.ai-pixel.online'), { code: 'ENOTFOUND' }),
       })
+    case 'hang':
+      return hang('/api/user/auth/refresh', init)
+    case 'stall':
+      return stalledBody('/api/user/auth/refresh', init)
     case '500':
       return json({ success: false, code: 'AUTH_INTERNAL_ERROR', message: 'Internal Server Error' }, 500)
     case '502':
@@ -98,25 +143,47 @@ const refreshReply = () => {
     case '401':
       return json({ success: false, code: 'AUTH_SESSION_REVOKED', message: 'Unauthorized' }, 401)
     default:
-      return json({
-        success: true,
-        data: {
-          access_token: 'mock-access-token',
-          access_expires_at: Math.floor(Date.now() / 1000) + 3600,
-          session: { sid: 'sid-1' },
-          user: { username: 'tester' },
-        },
-      })
+      return json({ success: true, data: sessionBundle() })
+  }
+}
+// Sign-in outcomes, switched per case. A login answers a session, a 2FA
+// challenge or a refusal (HTTP 200 with success:false, as new-api answers a
+// wrong password), or hangs; the 2FA check and the logout answer or hang.
+let loginMode = 'ok'
+let verifyMode = 'ok'
+let logoutMode = 'ok'
+const loginReply = (init) => {
+  switch (loginMode) {
+    case 'hang':
+      return hang('/api/user/login', init)
+    case 'reject':
+      return json({ success: false, message: '用户名或密码错误，或用户已被封禁' })
+    case '2fa':
+      return json({ success: true, data: { require_verification: true, flow_token: 'flow-1' } })
+    default:
+      return json({ success: true, data: sessionBundle() })
   }
 }
 let redirectViolations = 0
+// Every /api/* request, and whether it carried an abort signal: index.js
+// bounds each site call (/pg/chat/completions has its idle watchdog instead).
+const apiCalls = []
 globalThis.fetch = async (url, init = {}) => {
   const target = new URL(String(url))
   if (target.origin !== SITE) throw new Error(`unexpected host ${target.origin}`)
   if (init.redirect !== 'error') redirectViolations += 1
+  if (target.pathname.startsWith('/api/')) {
+    apiCalls.push({ path: target.pathname, signalled: init.signal instanceof AbortSignal })
+  }
   switch (target.pathname) {
     case '/api/user/auth/refresh':
-      return refreshReply()
+      return refreshReply(init)
+    case '/api/user/login':
+      return loginReply(init)
+    case '/api/user/login/verify':
+      return verifyMode === 'hang' ? hang(target.pathname, init) : json({ success: true, data: sessionBundle() })
+    case '/api/user/auth/logout':
+      return logoutMode === 'hang' ? hang(target.pathname, init) : json({ success: true })
     case '/api/user/self/groups':
       return json({ success: true, data: { 'room-1024': { is_room: true, room_name: 'Room 1024', ratio: 0.5, kind: 'pool' }, default: { ratio: 1 } } })
     case '/api/pricing':
@@ -152,10 +219,15 @@ const warnings = []
 const noImages = async () => { throw new Error('no images in this check') }
 let readImageRequest = noImages
 // A fake ctx around one real LlmRuntime; `edit` receives the status writes.
-const fakeCtxFor = ({ runtime, credentials, warnings, registered, edit = async () => {} }) => ({
+// Given `listeners`, the event handlers the plugin registers are kept there so
+// a check can fire them the way the host's events do.
+const fakeCtxFor = ({ runtime, credentials, warnings, registered, edit = async () => {}, listeners }) => ({
   logger: { warn: (...parts) => warnings.push(parts.map(String).join(' ')), info() {}, debug() {}, error() {} },
   effect(fn) { fn(); return () => {} },
-  on() { return () => {} },
+  on(name, listener) {
+    listeners?.set(name, [...(listeners.get(name) ?? []), listener])
+    return () => {}
+  },
   inject() {},
   get(name) {
     if (name === 'credentials') {
@@ -961,21 +1033,32 @@ const firePending = () => {
   timer.fired = true
   timer.callback()
 }
-const until = async (condition) => {
-  for (let i = 0; i < 100 && !condition(); i++) await new Promise((r) => realSetTimeout(r, 20))
+const until = async (condition, tries = 100) => {
+  for (let i = 0; i < tries && !condition(); i++) await new Promise((r) => realSetTimeout(r, 20))
 }
 // Lets the plugin's queued promise work run to its end.
 const drain = () => new Promise((r) => realSetTimeout(r, 0))
-const bootInstance = async (refreshCookie) => {
+// `refreshCookie` undefined: no session stored yet; `password`: a sign-in the
+// settings page submitted. The credential store here fires no events of its
+// own: `emit` runs the handlers the plugin registered for one host event.
+const bootInstance = async (refreshCookie, { password } = {}) => {
   const instanceApp = new Context()
   await instanceApp.plugin(LlmRuntime)
   const instanceConfig = plugin.Config({ username: 'tester' })
+  const listeners = new Map()
   const instance = {
-    credentials: new Map([['PIXEL_API_REFRESH', refreshCookie]]),
+    config: instanceConfig,
+    credentials: new Map([
+      ...(refreshCookie === undefined ? [] : [['PIXEL_API_REFRESH', refreshCookie]]),
+      ...(password === undefined ? [] : [['PIXEL_API_PASSWORD', password]]),
+    ]),
     warnings: [],
     registered: [],
     statuses: [],
     status: () => instance.statuses.at(-1),
+    emit: (name, ...args) => {
+      for (const listener of listeners.get(name) ?? []) listener(...args)
+    },
   }
   // The host commits each status write into the config cell, the copy the
   // plugin compares its next write against.
@@ -991,6 +1074,7 @@ const bootInstance = async (refreshCookie) => {
     warnings: instance.warnings,
     registered: instance.registered,
     edit,
+    listeners,
   }), instanceConfig)
   return instance
 }
@@ -1036,9 +1120,128 @@ check('  ...status none, asking to sign in again', statusIs(refused.status(), 'n
 check('  ...no retry scheduled', heldTimers.length === heldBefore, heldTimers.slice(heldBefore).map((timer) => timer.ms))
 check('  ...no routes registered', refused.registered.length === 0, refused.registered)
 refreshMode = 'ok'
+
+// ---------------------------------------------------------------------------
+// A site that stops answering: each site call ends on its own timer (index.js
+// SITE_API_TIMEOUT_MS) as the same 连接超时 failure, whether the connect or the
+// body read stalls. It must neither hold the reconcile queue for minutes nor
+// count toward the sign-in backoff. Here AbortSignal.timeout turns 10 s or more
+// into 50 ms. Node runs it on internal timers, not the global setTimeout, so
+// the hold above never sees it and still holds the plugin's 15 s retries.
+log('Site call timeouts')
+const realAbortTimeout = AbortSignal.timeout
+AbortSignal.timeout = (ms) => realAbortTimeout.call(AbortSignal, ms >= 10_000 ? 50 : ms)
+// About 5 s: long enough for the mock's 2 s no-signal failure to land, so a run
+// against an index.js without these timeouts reports what that build ends with.
+const SETTLE_TRIES = 250
+const TIMED_OUT = '连不上 PIXEL 主站：连接超时'
+const loginCalls = () => apiCalls.filter((call) => call.path === '/api/user/login').length
+
+const heldAtProbe = heldTimers.length
+realAbortTimeout.call(AbortSignal, 20_000)
+const probe = AbortSignal.timeout(20_000)
+await until(() => probe.aborted)
+check('harness: a 20 s AbortSignal.timeout holds no setTimeout, and the shortened one fires on its own',
+  heldTimers.length === heldAtProbe && probe.aborted && probe.reason?.name === 'TimeoutError',
+  { held: heldTimers.length - heldAtProbe, aborted: probe.aborted, reason: probe.reason?.name })
+
+// Sign-in: the settings page stored a password, and the site never answers.
+loginMode = 'hang'
+const stuckLogin = await bootInstance(undefined, { password: 'pw-1' })
+await until(() => stuckLogin.status()?.state === 'error', SETTLE_TRIES)
+check('login hangs: status error, 连不上 PIXEL 主站：连接超时',
+  statusIs(stuckLogin.status(), 'error', TIMED_OUT, 'tester'), stuckLogin.status())
+check('  ...the password credential is dropped', !stuckLogin.credentials.has('PIXEL_API_PASSWORD'), [...stuckLogin.credentials.keys()])
+// The same password stored again, then a settings commit: a volatile update
+// reruns reconcile without the password-entry event that lifts the backoff.
+loginMode = 'ok'
+let callsBefore = loginCalls()
+let writesBefore = stuckLogin.statuses.length
+stuckLogin.credentials.set('PIXEL_API_PASSWORD', 'pw-1')
+stuckLogin.emit('loader/volatile-update')
+await until(() => stuckLogin.statuses.length > writesBefore, SETTLE_TRIES)
+check('  ...site back, the same password again: signed in (queue free, no backoff)',
+  statusIs(stuckLogin.status(), 'ok', '', 'tester'), stuckLogin.status())
+check('  ...that sign-in reached the site', loginCalls() === callsBefore + 1, loginCalls() - callsBefore)
+
+// A refusal the site answered still counts: the backoff holds the retry back.
+loginMode = 'reject'
+const refusedLogin = await bootInstance(undefined, { password: 'pw-2' })
+await until(() => refusedLogin.status()?.state === 'error', SETTLE_TRIES)
+check('login refused (success:false): status error with the site text',
+  statusIs(refusedLogin.status(), 'error', '用户名或密码错误，或用户已被封禁', 'tester'), refusedLogin.status())
+callsBefore = loginCalls()
+writesBefore = refusedLogin.statuses.length
+refusedLogin.credentials.set('PIXEL_API_PASSWORD', 'pw-2')
+refusedLogin.emit('loader/volatile-update')
+await until(() => refusedLogin.statuses.length > writesBefore, SETTLE_TRIES)
+check('  ...the same password right after: held back, 登录连续失败…',
+  refusedLogin.status()?.state === 'error' && refusedLogin.status().message.startsWith('登录连续失败'), refusedLogin.status())
+check('  ...no second login request sent', loginCalls() === callsBefore, loginCalls() - callsBefore)
+
+// 2FA: the code check hangs. The challenge ends; a new sign-in starts another.
+loginMode = '2fa'
+verifyMode = 'hang'
+const stuckCode = await bootInstance(undefined, { password: 'pw-3' })
+await until(() => stuckCode.status()?.state === '2fa', SETTLE_TRIES)
+stuckCode.credentials.set('PIXEL_API_2FA', '123456')
+stuckCode.emit('credentials/reference-updated', 'PIXEL_API_2FA')
+await until(() => stuckCode.status()?.state === 'error', SETTLE_TRIES)
+check('2FA check hangs: status error, 连不上 PIXEL 主站：连接超时',
+  statusIs(stuckCode.status(), 'error', TIMED_OUT, 'tester'), stuckCode.status())
+check('  ...the code credential is dropped', !stuckCode.credentials.has('PIXEL_API_2FA'), [...stuckCode.credentials.keys()])
+verifyMode = 'ok'
+writesBefore = stuckCode.statuses.length
+stuckCode.credentials.set('PIXEL_API_PASSWORD', 'pw-3')
+stuckCode.emit('loader/volatile-update')
+await until(() => stuckCode.statuses.length > writesBefore && stuckCode.status()?.state === '2fa', SETTLE_TRIES)
+stuckCode.credentials.set('PIXEL_API_2FA', '654321')
+stuckCode.emit('credentials/reference-updated', 'PIXEL_API_2FA')
+await until(() => stuckCode.status()?.state === 'ok', SETTLE_TRIES)
+check('  ...site back: a new sign-in and code go through', statusIs(stuckCode.status(), 'ok', '', 'tester'), stuckCode.status())
+loginMode = 'ok'
+
+// Session refresh: as when the site is unreachable, the cookie stays and one
+// retry is due in 15 s; the log names the timeout, never a bodiless "HTTP 200".
+for (const [label, mode, cookie] of [
+  ['refresh hangs before any answer', 'hang', 'seed-refresh-d'],
+  ['refresh headers arrive, then the body stalls', 'stall', 'seed-refresh-e'],
+]) {
+  refreshMode = mode
+  const heldAtBoot = heldTimers.length
+  const retries = () => heldTimers.slice(heldAtBoot).filter((timer) => !timer.fired && !timer.cleared)
+  const stuck = await bootInstance(cookie)
+  await until(() => retries().length > 0, SETTLE_TRIES)
+  check(`${label}: the refresh cookie is kept`, stuck.credentials.get('PIXEL_API_REFRESH') === cookie, [...stuck.credentials.keys()])
+  check('  ...status error, with the fixed retry text and the configured user',
+    statusIs(stuck.status(), 'error', '暂时连不上 PIXEL 主站，登录状态已保留，稍后自动重试', 'tester'), stuck.status())
+  check('  ...one retry pending, due in 15 s', retries().length === 1 && retries()[0].ms === 15_000,
+    retries().map((timer) => timer.ms))
+  check('  ...the log names 连不上 PIXEL 主站：连接超时, never "HTTP 200"',
+    stuck.warnings.some((line) => line.includes(TIMED_OUT)) && !stuck.warnings.some((line) => line.includes('HTTP 200')),
+    stuck.warnings)
+}
+refreshMode = 'ok'
+
+// Sign-out: the revoke call hangs, and the sign-out completes regardless.
+const leaving = await bootInstance('seed-refresh-f')
+await until(() => leaving.status()?.state === 'ok', SETTLE_TRIES)
+logoutMode = 'hang'
+leaving.config.signOutAt[WRITE](Date.now())
+leaving.emit('loader/volatile-update')
+await until(() => leaving.status()?.state === 'none' && leaving.credentials.size === 0, SETTLE_TRIES)
+const logoutCall = stuckRequests.findLast((request) => request.path === '/api/user/auth/logout')
+check('sign-out while the logout call hangs: that call ends on its own timeout', logoutCall?.ended === 'timeout', logoutCall)
+check('  ...the sign-out still completes: status none', statusIs(leaving.status(), 'none', '', ''), leaving.status())
+check('  ...every credential is cleared', leaving.credentials.size === 0, [...leaving.credentials.keys()])
+logoutMode = 'ok'
+AbortSignal.timeout = realAbortTimeout
 globalThis.setTimeout = realSetTimeout
 globalThis.clearTimeout = realClearTimeout
 
 check('every site request refused redirects', redirectViolations === 0, redirectViolations)
+const unsignalled = apiCalls.filter((call) => !call.signalled)
+check('every /api/* request carried an abort signal', unsignalled.length === 0,
+  { count: unsignalled.length, paths: [...new Set(unsignalled.map((call) => call.path))] })
 check('no plugin warnings', warnings.length === 0, warnings)
 finish()

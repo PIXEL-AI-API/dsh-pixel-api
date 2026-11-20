@@ -95,7 +95,7 @@ https://github.com/PIXEL-AI-API/dsh-pixel-api#v0.1.0
 
 不联网、不用真实账号，主站接口全部在本地模拟：
 
-- `test/check-context.mjs`：用真实的 Harness `LlmRuntime` 加载插件，检查上下文窗口声明、按模型覆盖、设置页即时修改、错误分类（HTTP 错误与流中报错帧对应的错误码、`Retry-After`、请求编号）、会话续期失败的处理（连不上主站或 5xx 时保留登录并定时重试，主站明确拒绝时才退出登录）、工具结果的发送格式（`tool` 消息、图片随后附上、空的 system 消息不发送）、各类上游的缓存用量映射，以及回传数据的捕获与回发（Gemini 签名与令牌、GPT 加密推理，含经真实 `BlockAssembler` 组装后从会话日志读回的往返）。桌面版运行时下用 `ELECTRON_RUN_AS_NODE=1 "<DeepSeek Harness.exe>" test/check-context.mjs` 运行；能直接解析 `@deepseek-ai/*` 包的环境用 `node test/check-context.mjs`。
+- `test/check-context.mjs`：用真实的 Harness `LlmRuntime` 加载插件，检查上下文窗口声明、按模型覆盖、设置页即时修改、错误分类（HTTP 错误与流中报错帧对应的错误码、`Retry-After`、请求编号）、会话续期失败的处理（连不上主站或 5xx 时保留登录并定时重试，主站明确拒绝时才退出登录）、主站接口调用的超时（登录、两步验证、续期、退出登录在连接或读正文时卡住，都按时结束并报「连接超时」，超时不计入登录退避，每个 `/api/*` 请求都带超时信号）、工具结果的发送格式（`tool` 消息、图片随后附上、空的 system 消息不发送）、各类上游的缓存用量映射，以及回传数据的捕获与回发（Gemini 签名与令牌、GPT 加密推理，含经真实 `BlockAssembler` 组装后从会话日志读回的往返）。桌面版运行时下用 `ELECTRON_RUN_AS_NODE=1 "<DeepSeek Harness.exe>" test/check-context.mjs` 运行；能直接解析 `@deepseek-ai/*` 包的环境用 `node test/check-context.mjs`。
 - `test/check-update.mjs`：一键更新。用真实的 git 读本地临时仓库里的真实标签，用插件管理自带的来源校验判断更新目标，再用假的插件管理逐一模拟更新结果（更新中被移除、拒绝、需要重启、失败后恢复），不安装任何东西。运行方式同上，需要 PATH 里有 git。
 - `test/check-client.mjs`：在 vm 里执行 `client.js`，操作设置页：上下文窗口（默认收起；显示、校验、保存、恢复默认）、GPT 加密推理回传开关、插件版本（检查、确认、各状态显示）、退出登录确认、登录卡（字段校验、按密码凭据显示登录中、主站拒绝后的提示、两步验证输满 6 位自动提交与验证码被拒），以及登录会话保留但连不上主站时的界面。`node test/check-client.mjs`。
 - `test/check-load.mjs`、`test/check-fallback.mjs`：配置解析与图片缩放。
